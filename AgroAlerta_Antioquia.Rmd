@@ -1,0 +1,1056 @@
+---
+title: "AgroAlerta Antioquia"
+subtitle: "Modelo de inteligencia artificial para la predicción de humedad del suelo y clasificación del riesgo hídrico en zonas agrícolas de Antioquia"
+author: "Proyecto final – Inteligencia Artificial y Big Data"
+date: "`r format(Sys.Date(), '%d de %B de %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    df_print: paged
+    code_folding: hide
+    theme: flatly
+  pdf_document:
+    toc: true
+    number_sections: true
+    latex_engine: xelatex
+lang: es-CO
+fontsize: 10pt
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.path = "figures/",
+                      dpi = 110, fig.align = "center", out.width = "95%", fig.width = 8, fig.height = 4.6)
+options(scipen = 999, digits = 4, knitr.kable.NA = "")
+suppressPackageStartupMessages({
+  library(tidyverse); library(lubridate); library(caret); library(randomForest); library(e1071); library(kernlab)
+  library(klaR); library(pROC); library(PRROC); library(Metrics); library(tableone); library(corrplot)
+  library(gridExtra); library(sf); library(car); library(doParallel); library(knitr)
+})
+sf_use_s2(FALSE)
+select <- dplyr::select; filter <- dplyr::filter; slice <- dplyr::slice   # MASS (cargado por car/klaR) enmascara select()
+SEMILLA <- 2026; set.seed(SEMILLA)
+dir.create("outputs/cache", showWarnings = FALSE, recursive = TRUE)
+# Almacena en disco los resultados costosos (modelos). Para reentrenar: borrar outputs/cache/
+en_cache <- function(archivo, expr) { f <- file.path("outputs/cache", archivo); if (file.exists(f)) return(readRDS(f)); r <- expr; saveRDS(r, f); r }
+tema <- theme_minimal(base_size = 11) + theme(plot.title = element_text(face = "bold"), legend.position = "bottom")
+theme_set(tema)
+pal <- c(Bajo = "#2a9d8f", Alto = "#e76f51")
+```
+
+# Introducción
+
+```{r aviso-cobertura, results="asis", echo=FALSE}
+.dd <- readRDS("data/processed/dataset_modelado.rds"); .f <- sort(unique(as.Date(.dd$fecha))); .g <- cumsum(c(1, diff(.f) > 45))
+.v <- tapply(.f, .g, \(x) paste0(format(min(x)), " a ", format(max(x))))
+cat("> **AVISO — COBERTURA PARCIAL DE SMAP.** Esta versión del informe **no cubre la serie 2015–2026 completa**. La descarga de SMAP (variable objetivo) se detuvo antes de terminar: el dataset se construyó con **solo ",
+    length(.v), " ventanas de ~60 días**, no continuas (", paste(.v, collapse = "; "), "), de las ~71 ventanas que abarcan 2015-04-01 a 2026-11-15. La partición cronológica 80/20 se aplica sobre esas ventanas, por lo que el periodo de prueba es solo el último tramo disponible. ",
+    "**Los resultados son preliminares, ilustran la metodología y no deben interpretarse como una evaluación de 2015–2026**; no se puede evaluar estacionalidad ni variabilidad interanual completa. El pipeline (`scripts/`) puede completarse y recompilarse sin cambios.\n", sep = "")
+```
+
+La agricultura antioqueña —café, caña panelera, plátano, papa, aguacate, cacao, entre otros— depende de la lluvia y de la
+humedad almacenada en el suelo. En un territorio de montaña, con diferencias de altitud que van de valles cálidos a páramos,
+la disponibilidad de agua cambia mucho de un municipio a otro y de una temporada a otra. Para un pequeño productor campesino,
+conocer con antelación que el suelo se está secando más de lo habitual puede ser la diferencia entre programar un riego de
+apoyo o enterarse tarde. Para una Unidad Municipal de Asistencia Técnica Agropecuaria (UMATA), esa misma información sirve
+para decidir **dónde** enviar primero a sus técnicos y los recursos limitados de apoyo.
+
+Este informe desarrolla **AgroAlerta Antioquia**, un sistema de apoyo a decisiones basado en aprendizaje automático. A partir de
+datos abiertos —humedad superficial del suelo medida por el satélite SMAP de la NASA, variables meteorológicas de NASA POWER,
+límites municipales del DANE y la oferta agrícola municipal de la UPRA— se entrenan y comparan modelos que (i) estiman la
+humedad del suelo y (ii) clasifican si esta es inusualmente baja (riesgo hídrico alto) o no. Todo el flujo (R 4.5; R Core Team, 2025; `caret`, Kuhn, 2008), desde la descarga de
+los datos hasta los resultados, es reproducible con los scripts de la carpeta `scripts/`.
+
+> **Alcance y honestidad metodológica.** El «riesgo hídrico» aquí es un *indicador estadístico de humedad del suelo
+> inusualmente baja* respecto a la historia de cada municipio en cada época del año. **No** es una medición oficial de sequía
+> agrícola, **no** mide pérdidas en cultivos y **no** sustituye las mediciones de campo ni el criterio de los profesionales
+> agropecuarios.
+
+# Planteamiento del problema
+
+## Contexto
+
+La actividad agrícola en Antioquia depende considerablemente de las condiciones climáticas y de la disponibilidad de agua en
+el suelo. Las variaciones en la precipitación, los aumentos de temperatura y los periodos secos pueden generar déficit hídrico
+y riesgos para los cultivos (la sequía agrícola se define justamente por la falta de humedad en el suelo para el cultivo; Wilhite & Glantz, 1985) (Seneviratne et al., 2010; Karthikeyan et al., 2020). Los pequeños productores no siempre cuentan
+con herramientas que les permitan anticiparse, y los gobiernos municipales necesitan información para priorizar la asistencia
+técnica y fortalecer sus estrategias de adaptación al cambio climático (Vergara et al., 2014; OECD, 2015, 2026).
+
+## Pregunta de investigación
+
+¿Es posible desarrollar modelos de inteligencia artificial utilizando información climática y satelital abierta para predecir
+la humedad del suelo e identificar anticipadamente condiciones de riesgo hídrico en las zonas agrícolas de Antioquia,
+contribuyendo a mejorar la toma de decisiones de los productores campesinos y de las administraciones municipales?
+
+# Justificación
+
+1. **Vacío de información local.** La red de estaciones in situ es escasa en las zonas rurales de ladera; el satélite SMAP
+   observa toda la región cada 2–3 días, aunque con un píxel de ~9 km.
+2. **Datos abiertos y reproducibles.** Todas las fuentes son públicas y gratuitas, lo que permite que cualquier municipio
+   replique y actualice el sistema.
+3. **Utilidad para la gestión pública.** Un indicador comparable entre los municipios permite priorizar la asistencia técnica
+   y la planeación del riego con criterios objetivos.
+4. **Valor metodológico.** Comparar un modelo lineal interpretable con algoritmos no lineales muestra cuánta complejidad
+   adicional se justifica para este problema.
+
+# Objetivos
+
+**Objetivo general.** Desarrollar y comparar modelos de aprendizaje automático supervisado y un modelo de regresión lineal
+múltiple que permitan predecir la humedad del suelo y clasificar el riesgo de estrés hídrico en zonas agrícolas de Antioquia,
+utilizando información climática, satelital y territorial de fuentes oficiales y abiertas.
+
+**Objetivos específicos.**
+
+1. Recopilar, integrar y procesar información climática, satelital y territorial (NASA, IDEAM, UPRA y DANE).
+2. Construir una base de datos estructurada que relacione las condiciones meteorológicas con la humedad del suelo.
+3. Implementar modelos de regresión para predecir la humedad del suelo.
+4. Implementar modelos de clasificación supervisada para identificar condiciones de riesgo hídrico.
+5. Desarrollar un modelo de regresión lineal múltiple interpretable.
+6. Comparar los modelos con métricas estadísticas y seleccionar los de mejor desempeño.
+7. Proponer una aplicación de los resultados para la gestión pública agropecuaria y la toma de decisiones campesinas.
+
+# Fuentes de información y metodología de recopilación
+
+Todas las descargas están automatizadas en `scripts/` y los datos originales se conservan en `data/raw/`. Las fuentes se
+consultaron en noviembre de 2026.
+
+| Fuente | Qué aporta | Resolución | Acceso | Script |
+|---|---|---|---|---|
+| **NASA SMAP Enhanced L3 (SPL3SMP_E v006)** | Humedad volumétrica superficial del suelo (m³/m³) — **variable objetivo** | Malla EASE-Grid 2.0 de 9 km; 1 pasada AM (6 h) y 1 PM (18 h) | NSIDC vía servicio *Harmony* (recorte por caja en servidor), con credenciales Earthdata | `02_smap_descarga.R` |
+| **NASA POWER (API diaria, comunidad AG)** | Precipitación, temperatura, humedad relativa, radiación, viento | ≈0,5° × 0,625° (MERRA-2) y 1° (radiación CERES); diaria | API pública | `03_power_descarga.R` |
+| **DANE – MGN 2025** | Límites de los 125 municipios | Vectorial | FeatureServer ArcGIS (capa 317) | `data/raw/dane/` |
+| **UPRA/MinAgricultura – EVA 2019–2025** | Cultivos y área sembrada por municipio | Municipal, anual | datos.gov.co (`uejq-wxrr`) | `05_upra_eva.R` |
+| **IDEAM** | Estaciones: precipitación, temperatura y humedad del aire (contraste con POWER) | Puntual, alta frecuencia | datos.gov.co | `04_ideam_descarga.R` |
+
+SMAP es la misión de la NASA diseñada para medir la humedad del suelo desde el espacio con un radiómetro en banda L (Entekhabi et al., 2010); el producto *Enhanced* L3 mejora la resolución a 9 km (Chan et al., 2018; O'Neill et al., 2023). NASA POWER distribuye datos meteorológicos y de energía solar derivados de satélites y reanálisis (Sparks, 2018). La ciencia de la humedad del suelo y su papel en el clima y la agricultura se revisa en Seneviratne et al. (2010), y el uso de aprendizaje automático para estimarla en Sungmin y Orth (2021).
+
+**Estrategia de integración.** Las fuentes tienen resoluciones distintas, por lo que se eligió el **municipio** como unidad
+espacial (el nivel en que operan las UMATA) y el **día** como unidad temporal:
+
+- **SMAP** → cada píxel de 9 km se asigna al municipio que contiene su centro; la humedad municipal diaria es el promedio de
+  los píxeles válidos (promedio de las pasadas AM y PM disponibles).
+- **POWER** → se consulta el punto interior de cada municipio (`st_point_on_surface`). Como la malla de POWER es gruesa,
+  municipios vecinos comparten celda: POWER describe el clima *regional*, no microclimas de ladera.
+- **EVA** → se resume el cultivo predominante (por área sembrada, trienio 2023–2025) como contexto territorial.
+- **IDEAM** → se usa como contraste independiente de la precipitación de POWER (sección *Contraste con IDEAM*).
+
+**Datos observados vs. construidos.** Observados: humedad SMAP, variables POWER (reanálisis/satélite, no mediciones directas
+de campo), EVA, límites DANE. Construidos por nosotros: acumulados, rezagos, anomalías, la variable `Riesgo_Hidrico` y
+las predicciones de los modelos.
+
+```{r datos}
+d    <- readRDS("data/processed/dataset_modelado.rds") |> mutate(fecha = as.Date(fecha)) |> arrange(fecha, cod_mpio)
+mun  <- readRDS("data/processed/municipios.rds")
+cal  <- readRDS("data/processed/calidad_smap.rds")
+```
+
+## Calidad de las observaciones SMAP
+
+El indicador `retrieval_qual_flag` de SMAP marca con el bit 0 = 0 las recuperaciones de «calidad recomendada» y con el bit 3 = 1
+las recuperaciones exitosas. En Antioquia, la densa vegetación tropical hace que la gran mayoría de las recuperaciones exitosas
+**no** cumpla el criterio de calidad recomendada:
+
+```{r calidad-smap}
+tibble(Criterio = c("Recuperaciones con valor (píxel-pasada)", "Exitosas y físicamente plausibles (0 < θ ≤ 0,6 m³/m³) — **filtro principal**",
+                    "Además, calidad recomendada (bit 0 = 0) — filtro estricto"),
+       N = c(cal$global$retrievals, cal$global$validos, cal$global$validos_estricto),
+       Porcentaje = round(100 * N / cal$global$retrievals, 1)) |> kable(format.args = list(big.mark = "."))
+```
+
+Exigir calidad recomendada descartaría ~`r round(100 - 100*cal$global$validos_estricto/cal$global$retrievals)` % de los datos
+y dejaría a la mayoría de los municipios casi sin observaciones. Por ello el **filtro principal** conserva las recuperaciones
+exitosas y físicamente plausibles, y el **filtro estricto** se emplea como análisis de sensibilidad (sección *Análisis de sensibilidad*). Es una
+limitación que se declara explícitamente: en zonas de alta biomasa la humedad SMAP tiene mayor incertidumbre.
+
+# Construcción del dataset
+
+## Ensamblaje y variables derivadas
+
+`scripts/06_integrar_dataset.R` produce una fila por **municipio × día** con humedad SMAP disponible y variables POWER completas.
+Las variables derivadas usan únicamente información del día en curso y del pasado (acumulados móviles, medias móviles y días
+consecutivos sin lluvia ≥ 1 mm), por lo que no hay información futura en los predictores.
+
+```{r dataset-dim}
+cat("Filas:", format(nrow(d), big.mark = "."), "| Municipios con datos SMAP:", n_distinct(d$cod_mpio), "de 125 | Periodo:",
+    format(min(d$fecha)), "a", format(max(d$fecha)), "\n")
+cat("Municipios sin ningún píxel SMAP (centro dentro del polígono):", 125 - n_distinct(d$cod_mpio),
+    "— son municipios pequeños; el píxel de 9 km no los resuelve.\n")
+```
+
+## Partición temporal y construcción de `Riesgo_Hidrico` {#riesgo}
+
+**Estrategia de partición.** Los datos son una serie temporal repetida en 100+ municipios. Una partición aleatoria 80/20
+pondría días contiguos (casi idénticos por autocorrelación) en entrenamiento y prueba, inflando el desempeño. Por eso se usa una
+**partición cronológica**: el 80 % más antiguo de las fechas entrena y el 20 % más reciente se reserva para prueba, que es
+también el escenario de uso real (predecir el futuro). En la sección *Validación y evaluación* se cuantifica cuánto se sobreestimaría el desempeño con una
+partición aleatoria.
+
+**Definición del riesgo.** `Riesgo_Hidrico = Alto` si la humedad del suelo es **≤ percentil 20** de la distribución histórica
+del *mismo municipio y el mismo mes del año*; en otro caso `Bajo`. La lógica es análoga a la de los monitores de sequía basados en percentiles (Svoboda et al., 2002). Calcular el percentil por municipio-mes evita confundir
+diferencias naturales entre regiones o estaciones (un municipio seco no está «en sequía» por ser seco) con anomalías. **Los
+percentiles se calculan solo con el periodo de entrenamiento** y se aplican a la prueba, para no filtrar información. Si una celda
+municipio–mes tiene menos de 20 observaciones de entrenamiento, se usa el percentil del municipio completo.
+
+```{r particion-riesgo}
+CORTE <- as.Date(quantile(as.numeric(d$fecha), 0.80, type = 1), origin = "1970-01-01")
+d$conjunto <- factor(ifelse(d$fecha <= CORTE, "Entrenamiento", "Prueba"), levels = c("Entrenamiento", "Prueba"))
+calc_umbral <- function(train, p = 0.20) {
+  mm <- train |> group_by(cod_mpio, Mes) |> summarise(n_mm = n(), u_mm = quantile(Humedad_Suelo, p), .groups = "drop")
+  m  <- train |> group_by(cod_mpio) |> summarise(u_m = quantile(Humedad_Suelo, p), .groups = "drop")
+  list(mm = mm, m = m)
+}
+etiquetar <- function(df, umb, min_n = 20) {
+  df |> left_join(umb$mm, by = c("cod_mpio", "Mes")) |> left_join(umb$m, by = "cod_mpio") |>
+    mutate(Umbral = ifelse(!is.na(n_mm) & n_mm >= min_n, u_mm, u_m),
+           Riesgo_Hidrico = factor(ifelse(Humedad_Suelo <= Umbral, "Alto", "Bajo"), levels = c("Alto", "Bajo"))) |>
+    select(-n_mm, -u_mm, -u_m)
+}
+umbral20 <- calc_umbral(filter(d, conjunto == "Entrenamiento"))
+d <- etiquetar(d, umbral20)
+cat("Fecha de corte:", format(CORTE), "\n")
+d |> count(conjunto) |> mutate(`%` = round(100 * n / sum(n), 1)) |> kable(format.args = list(big.mark = "."))
+```
+
+# Descripción de variables
+
+| Variable | Descripción | Unidad | Tipo | Procedencia |
+|---|---|---|---|---|
+| `Municipio`, `cod_mpio` | Municipio de Antioquia | — | Categórica | DANE |
+| `fecha` | Fecha de observación | día | Temporal | — |
+| `Humedad_Suelo` | Humedad volumétrica superficial (≈5 cm), media de píxeles válidos AM/PM | m³/m³ | Continua (**objetivo**) | SMAP |
+| `Precipitacion` | Precipitación diaria corregida (PRECTOTCORR) | mm/día | Continua | POWER |
+| `Temperatura_Media/Maxima/Minima` | Temperatura del aire a 2 m | °C | Continua | POWER |
+| `Humedad_Relativa` | Humedad relativa a 2 m | % | Continua | POWER |
+| `Radiacion_Solar` | Radiación de onda corta en superficie, cielo real | kWh/m²/día | Continua | POWER |
+| `Viento` | Velocidad del viento a 2 m | m/s | Continua | POWER |
+| `Precipitacion_Acum_3d/7d/14d/30d/60d` | Precipitación acumulada en los últimos *k* días (incluye el día actual) | mm | Continua | Derivada |
+| `Temperatura_Promedio_7d`, `Humedad_Relativa_Prom_7d`, `Radiacion_Prom_7d` | Medias móviles de 7 días | °C, %, kWh/m²/día | Continua | Derivada |
+| `Dias_Sin_Lluvia` | Días consecutivos con precipitación < 1 mm | días | Continua | Derivada |
+| `Rango_Termico` | Tmáx − Tmín | °C | Continua | Derivada |
+| `Estacion_Sen/Cos` | Codificación cíclica del día del año | — | Continua | Derivada |
+| `Elevacion` | **Elevación media de la celda POWER** (no del municipio) | m | Continua | POWER |
+| `Latitud`, `Longitud` | Punto interior del municipio | grados | Continua | DANE |
+| `Tipo_Cultivo` | Cultivo con mayor área sembrada (trienio 2023–2025) | — | Categórica | UPRA-EVA |
+| `Anom_Precip_30d/60d`, `Anom_Temp_7d` | Diferencia respecto a la climatología municipio–mes **del periodo de entrenamiento** | mm, °C | Continua | Derivada (preprocesamiento) |
+| `Riesgo_Hidrico` | Alto/Bajo según percentil 20 municipio–mes (sección *Partición temporal y construcción de Riesgo_Hidrico*) | — | Binaria (**objetivo**) | Derivada |
+
+> `Elevacion` no se obtuvo de un modelo digital del terreno (p. ej., SRTM): es la elevación media de la celda de POWER y por
+> tanto suaviza el relieve. Se mantiene por ser la única disponible en la misma fuente y se declara como limitación.
+
+
+# Análisis exploratorio de datos (EDA)
+
+El EDA es descriptivo: **no se estima ningún parámetro del modelo** (umbrales, medianas de imputación, escalas) con datos de la
+partición de prueba. Los gráficos usan todo el periodo para mostrar la dinámica temporal completa, indicando cuando se separa
+entrenamiento y prueba.
+
+## Dimensiones, tipos y resumen estadístico
+
+```{r eda-dim}
+cat("Dimensiones:", format(nrow(d), big.mark = "."), "filas x", ncol(d), "columnas\n")
+tibble(Variable = names(d), Clase = sapply(d, \(x) class(x)[1]), `Valores distintos` = sapply(d, n_distinct),
+       `Faltantes` = sapply(d, \(x) sum(is.na(x)))) |> kable(caption = "Tipos de variable, cardinalidad y valores faltantes.")
+```
+
+```{r eda-resumen}
+vars_res <- c("Humedad_Suelo", "n_pix", "Precipitacion", "Precipitacion_Acum_7d", "Precipitacion_Acum_30d", "Dias_Sin_Lluvia",
+              "Temperatura_Media", "Temperatura_Maxima", "Temperatura_Minima", "Humedad_Relativa", "Radiacion_Solar", "Viento", "Elevacion")
+d |> select(all_of(vars_res)) |> pivot_longer(everything(), names_to = "Variable") |> group_by(Variable) |>
+  summarise(N = sum(!is.na(value)), Media = mean(value, na.rm = TRUE), DE = sd(value, na.rm = TRUE), Min = min(value, na.rm = TRUE),
+            P25 = quantile(value, .25, na.rm = TRUE), Mediana = median(value, na.rm = TRUE), P75 = quantile(value, .75, na.rm = TRUE),
+            Max = max(value, na.rm = TRUE), .groups = "drop") |>
+  slice(match(vars_res, Variable)) |> kable(digits = 3, caption = "Resumen estadístico de las variables principales.", format.args = list(big.mark = "."))
+```
+
+La humedad del suelo tiene una media de `r round(mean(d$Humedad_Suelo), 3)` m³/m³ y una desviación estándar de
+`r round(sd(d$Humedad_Suelo), 3)`: la variabilidad entre municipios y épocas es grande frente a su nivel medio. La precipitación está muy
+sesgada a la derecha (muchos días secos o con poca lluvia y pocos días muy lluviosos), típico de series diarias de lluvia.
+
+## Valores faltantes
+
+```{r eda-faltantes}
+fal <- d |> summarise(across(everything(), \(x) sum(is.na(x)))) |> pivot_longer(everything(), names_to = "Variable", values_to = "Faltantes") |>
+  filter(Faltantes > 0) |> mutate(`%` = round(100 * Faltantes / nrow(d), 2))
+if (nrow(fal)) kable(fal, caption = "Variables con valores faltantes.") else cat("No hay valores faltantes en las variables numéricas del dataset integrado.\n")
+```
+
+El dataset integrado se construyó exigiendo variables POWER completas y humedad SMAP válida; los únicos huecos relevantes provienen de
+`Tipo_Cultivo` (municipios sin registros EVA) y, si los hubiera, de `Viento`. Más importante: la **ausencia de días** (SMAP no
+observa un municipio todos los días ni cuando no hay recuperación válida) hace que la serie por municipio sea irregular.
+
+## Distribución de las variables
+
+```{r eda-hist, fig.height=7}
+p1 <- ggplot(d, aes(Precipitacion)) + geom_histogram(bins = 60, fill = "#457b9d") + scale_x_continuous(trans = "log1p", breaks = c(0, 1, 5, 20, 80)) +
+  labs(title = "Precipitación diaria (POWER)", x = "mm/día (escala log1p)", y = "Frecuencia")
+p2 <- ggplot(d, aes(Temperatura_Media)) + geom_histogram(bins = 50, fill = "#e9c46a") + labs(title = "Temperatura media diaria", x = "°C", y = "Frecuencia")
+p3 <- ggplot(d, aes(Humedad_Suelo)) + geom_histogram(bins = 50, fill = "#2a9d8f") + labs(title = "Humedad superficial del suelo (SMAP)", x = "m³/m³", y = "Frecuencia")
+p4 <- ggplot(d, aes(Humedad_Relativa)) + geom_histogram(bins = 50, fill = "#8d99ae") + labs(title = "Humedad relativa del aire", x = "%", y = "Frecuencia")
+grid.arrange(p1, p2, p3, p4, ncol = 2)
+```
+
+## Valores atípicos
+
+```{r eda-box, fig.height=6.5}
+vb <- c("Precipitacion", "Temperatura_Media", "Temperatura_Maxima", "Humedad_Relativa", "Radiacion_Solar", "Viento", "Humedad_Suelo")
+d |> select(all_of(vb)) |> pivot_longer(everything()) |> ggplot(aes(name, value)) + geom_boxplot(fill = "#a8dadc", outlier.size = .4, outlier.alpha = .3) +
+  facet_wrap(~name, scales = "free", nrow = 2) + labs(title = "Boxplots de variables climáticas y humedad del suelo", x = NULL, y = "Valor (unidad propia de cada variable)") +
+  theme(axis.text.x = element_blank())
+```
+
+```{r eda-outliers}
+iqr_out <- function(x) { q <- quantile(x, c(.25, .75), na.rm = TRUE); r <- q[2] - q[1]; mean(x < q[1] - 1.5 * r | x > q[2] + 1.5 * r, na.rm = TRUE) * 100 }
+tibble(Variable = vb, `% atípicos (regla 1,5·IQR)` = sapply(vb, \(v) iqr_out(d[[v]]))) |> kable(digits = 2, caption = "Proporción de valores atípicos por la regla de Tukey.")
+```
+
+Los atípicos de precipitación **no son errores**: son tormentas reales y portan información sobre cuándo el suelo se recarga. Por eso no se eliminan:
+se **winsorizan** (se acotan al percentil 1 y 99 del entrenamiento) solo para los modelos sensibles a valores extremos (sección *Preprocesamiento*).
+
+## Correlaciones
+
+```{r eda-corr, fig.height=6.8, fig.width=7.5}
+vc <- c("Humedad_Suelo", "Precipitacion", "Precipitacion_Acum_7d", "Precipitacion_Acum_30d", "Precipitacion_Acum_60d", "Dias_Sin_Lluvia",
+        "Temperatura_Media", "Rango_Termico", "Humedad_Relativa", "Radiacion_Solar", "Viento", "Elevacion")
+M <- cor(d[vc], use = "pairwise.complete.obs")
+corrplot(M, method = "color", type = "upper", tl.col = "black", tl.cex = .75, addCoef.col = "black", number.cex = .55,
+         col = colorRampPalette(c("#e76f51", "white", "#2a9d8f"))(200), title = "Matriz de correlación de Pearson", mar = c(0, 0, 2, 0))
+```
+
+Las mayores asociaciones con la humedad del suelo ayudan a anticipar qué variables serán importantes, pero **correlación no es causalidad**: la
+humedad relativa y la radiación, por ejemplo, reflejan nubosidad y lluvia reciente; la elevación se asocia con la temperatura (a mayor altura, menor temperatura) y con el régimen
+de lluvias de cada zona.
+
+## Evolución temporal
+
+```{r eda-serie, fig.height=5.8}
+mensual <- d |> mutate(mes = floor_date(fecha, "month")) |> group_by(mes) |>
+  summarise(`Precipitación (mm/día)` = mean(Precipitacion), `Humedad del suelo (m³/m³)` = mean(Humedad_Suelo), .groups = "drop") |>
+  pivot_longer(-mes, names_to = "Variable", values_to = "valor")
+ggplot(mensual, aes(mes, valor)) + geom_line(color = "#264653") + geom_point(size = .8, color = "#264653") +
+  geom_vline(xintercept = CORTE, linetype = 2, color = "#e76f51") + facet_wrap(~Variable, ncol = 1, scales = "free_y") +
+  annotate("text", x = CORTE, y = Inf, label = " inicio de la prueba", hjust = 0, vjust = 1.5, color = "#e76f51", size = 3) +
+  labs(title = "Promedio mensual en los municipios con datos", x = NULL, y = NULL)
+```
+
+Como la cobertura SMAP disponible es **discontinua** (tramos aislados, véase el aviso inicial), la serie mensual solo permite ver esos tramos y **no** sirve para caracterizar la estacionalidad ni la variabilidad interanual. Conceptualmente, la humedad del suelo responde a la lluvia acumulada con cierto
+rezago; esa memoria es la razón por la cual los acumulados de 7–60 días se incluyen como predictores.
+
+## Humedad del suelo entre municipios
+
+```{r eda-mun, fig.height=6.5}
+orden <- d |> count(Municipio) |> slice_max(n, n = 15) |> pull(Municipio)
+d |> filter(Municipio %in% orden) |> mutate(Municipio = fct_reorder(Municipio, Humedad_Suelo, median)) |>
+  ggplot(aes(Municipio, Humedad_Suelo)) + geom_boxplot(fill = "#2a9d8f", alpha = .6, outlier.size = .3) + coord_flip() +
+  labs(title = "Humedad del suelo por municipio (15 con más observaciones)", x = NULL, y = "Humedad volumétrica (m³/m³)")
+```
+
+## Distribución de las clases de riesgo hídrico
+
+```{r eda-riesgo, fig.height=4.2}
+fr <- d |> count(conjunto, Riesgo_Hidrico) |> group_by(conjunto) |> mutate(pct = 100 * n / sum(n))
+ggplot(fr, aes(conjunto, n, fill = Riesgo_Hidrico)) + geom_col(position = "dodge") + geom_text(aes(label = sprintf("%.1f %%", pct)), position = position_dodge(.9), vjust = -.3, size = 3.4) +
+  scale_fill_manual(values = pal) + labs(title = "Frecuencia de las clases de riesgo hídrico", x = NULL, y = "Observaciones", fill = "Riesgo")
+anual <- d |> mutate(Año = year(fecha)) |> group_by(Año) |> summarise(`% riesgo alto` = 100 * mean(Riesgo_Hidrico == "Alto"), n = n())
+ggplot(anual, aes(factor(Año), `% riesgo alto`)) + geom_col(fill = "#e76f51") + geom_hline(yintercept = 20, linetype = 2) +
+  labs(title = "Porcentaje de observaciones en riesgo alto por año", subtitle = "La línea punteada marca el 20 % esperado si la distribución no cambiara", x = "Año", y = "% en riesgo alto")
+```
+
+Por construcción, en el periodo de entrenamiento ~20 % de las observaciones son de riesgo alto. En la prueba esa proporción **puede diferir**: eso no es un error,
+sino un cambio real en la humedad (tramos más secos o más húmedos que el histórico de referencia, o simplemente otra época del año dentro de una cobertura discontinua) y representa justo el reto de generalizar al futuro.
+
+# Preprocesamiento
+
+El preprocesamiento sigue una regla de oro: **todo parámetro se aprende en entrenamiento y se aplica, sin reajustar, a la prueba**.
+
+1. **Anomalías respecto a la climatología.** Para cada municipio y mes se calcula la media de entrenamiento de la lluvia acumulada (30 y 60 días) y de la temperatura de 7 días;
+   las anomalías son la diferencia respecto a esa climatología. Responden a la pregunta «¿está lloviendo menos de lo normal *aquí y en esta época*?».
+2. **Winsorización** al percentil 1–99 (límites del entrenamiento) de las variables continuas, para limitar el efecto de extremos sin descartar observaciones.
+3. **Imputación por mediana** (de entrenamiento), **centrado y escalamiento** (`caret::preProcess`) de los predictores. La **variable respuesta no se escala**: las predicciones quedan en m³/m³.
+4. **Codificación de la variable categórica** `Tipo_Cultivo` con `dummyVars` (se agrupan los cultivos poco frecuentes en «Otros»).
+5. **Variables temporales**: el día del año se codifica de forma cíclica (seno y coseno) para que el 31 de diciembre y el 1 de enero queden próximos.
+
+```{r preproceso}
+tr <- d |> filter(conjunto == "Entrenamiento"); te <- d |> filter(conjunto == "Prueba")
+
+# (1) Climatología municipio-mes SOLO con entrenamiento
+clim_mm <- tr |> group_by(cod_mpio, Mes) |> summarise(c30 = mean(Precipitacion_Acum_30d), c60 = mean(Precipitacion_Acum_60d), cT = mean(Temperatura_Promedio_7d), .groups = "drop")
+clim_m  <- tr |> group_by(cod_mpio) |> summarise(m30 = mean(Precipitacion_Acum_30d), m60 = mean(Precipitacion_Acum_60d), mT = mean(Temperatura_Promedio_7d), .groups = "drop")
+agregar_anom <- function(df) {
+  df |> left_join(clim_mm, by = c("cod_mpio", "Mes")) |> left_join(clim_m, by = "cod_mpio") |>
+    mutate(Anom_Precip_30d = Precipitacion_Acum_30d - coalesce(c30, m30), Anom_Precip_60d = Precipitacion_Acum_60d - coalesce(c60, m60),
+           Anom_Temp_7d = Temperatura_Promedio_7d - coalesce(cT, mT)) |> select(-c30, -c60, -cT, -m30, -m60, -mT)
+}
+d <- agregar_anom(d); tr <- agregar_anom(tr); te <- agregar_anom(te)
+
+vars_num <- c("Precipitacion", "Precipitacion_Acum_3d", "Precipitacion_Acum_7d", "Precipitacion_Acum_14d", "Precipitacion_Acum_30d", "Precipitacion_Acum_60d",
+              "Dias_Sin_Lluvia", "Temperatura_Media", "Temperatura_Maxima", "Temperatura_Minima", "Rango_Termico", "Temperatura_Promedio_7d",
+              "Humedad_Relativa", "Humedad_Relativa_Prom_7d", "Radiacion_Solar", "Radiacion_Prom_7d", "Viento", "Elevacion", "Latitud", "Longitud",
+              "Estacion_Sen", "Estacion_Cos", "Anom_Precip_30d", "Anom_Precip_60d", "Anom_Temp_7d")
+vars_win <- setdiff(vars_num, c("Estacion_Sen", "Estacion_Cos", "Latitud", "Longitud", "Elevacion"))
+
+# (2) Winsorización con límites de entrenamiento
+lim_lo <- sapply(tr[vars_win], \(x) unname(quantile(x, .01, na.rm = TRUE))); lim_hi <- sapply(tr[vars_win], \(x) unname(quantile(x, .99, na.rm = TRUE)))
+winsor <- function(df) { for (v in vars_win) df[[v]] <- pmin(pmax(df[[v]], lim_lo[[v]]), lim_hi[[v]]); df }
+
+# (4) Cultivos: los 6 más frecuentes en entrenamiento; el resto -> "Otros"
+top_cult <- tr |> count(Tipo_Cultivo, sort = TRUE) |> filter(!is.na(Tipo_Cultivo)) |> slice_head(n = 6) |> pull(Tipo_Cultivo)
+con_cultivo <- function(df) mutate(df, Cultivo = factor(ifelse(Tipo_Cultivo %in% top_cult, Tipo_Cultivo, "Otros"), levels = c(top_cult, "Otros")))
+
+# (3) imputación, centrado y escalamiento: ajustados SOLO en entrenamiento
+pp <- preProcess(winsor(tr)[vars_num], method = c("medianImpute", "center", "scale"))
+dv <- dummyVars(~ Cultivo, data = con_cultivo(tr), fullRank = TRUE)
+prep_x <- function(df) {
+  df <- con_cultivo(winsor(df))
+  X <- cbind(predict(pp, df[vars_num]), predict(dv, df["Cultivo"]))
+  X <- as.data.frame(X); names(X) <- make.names(names(X)); X
+}
+X_tr <- prep_x(tr); X_te <- prep_x(te)
+y_tr <- tr$Humedad_Suelo; y_te <- te$Humedad_Suelo
+c_tr <- tr$Riesgo_Hidrico; c_te <- te$Riesgo_Hidrico
+cat("Predictores finales:", ncol(X_tr), "(", length(vars_num), "numéricos +", ncol(X_tr) - length(vars_num), "dummies de cultivo )\n")
+cat("Entrenamiento:", nrow(X_tr), "| Prueba:", nrow(X_te), "| Cultivos agrupados:", paste(top_cult, collapse = ", "), "\n")
+stopifnot(!anyNA(X_tr), !anyNA(X_te), max(tr$fecha) < min(te$fecha))
+```
+
+# Metodología de modelado
+
+## Partición y validación
+
+- **Prueba (20 %)**: periodo cronológicamente posterior, intocado hasta la evaluación final.
+- **Validación interna**: dentro del entrenamiento se usa **validación cruzada de origen móvil (*rolling origin*)** con 4 pliegues: el entrenamiento se divide en 5 bloques cronológicos; para el pliegue *k* se entrena con los
+  bloques anteriores a *k* (menos una **franja de seguridad de 30 días** para romper la autocorrelación) y se valida en el bloque *k*. Imita el uso real (entrenar con el pasado, predecir el futuro) y evita la validación cruzada aleatoria
+  10×3, cuyos pliegues mezclan días contiguos y son demasiado optimistas con datos con dependencia temporal y espacial (Roberts et al., 2017). En la sección *Validación y evaluación* se cuantifica esa diferencia.
+- **Submuestra de ajuste.** Los algoritmos de núcleo (SVR/SVM) y vecinos escalan mal con >100 mil filas. Para comparar los modelos en igualdad de condiciones, todos se ajustan y sintonizan con una **misma submuestra aleatoria de
+  `r format(12000, big.mark = ".")` filas del entrenamiento**, y se **evalúan sobre toda la prueba**. La regresión lineal (sección propia) se reajusta además con el entrenamiento completo.
+
+```{r muestra}
+set.seed(SEMILLA)
+N_SUB <- 12000
+idx_sub <- sort(sample(nrow(X_tr), min(N_SUB, nrow(X_tr))))
+Xs <- X_tr[idx_sub, ]; ys <- y_tr[idx_sub]; cs <- c_tr[idx_sub]; fs <- tr$fecha[idx_sub]
+blk <- cut(as.numeric(fs), quantile(as.numeric(fs), seq(0, 1, .2)), include.lowest = TRUE, labels = FALSE)
+index    <- lapply(2:5, \(k) which(fs < min(fs[blk == k]) - 30)); names(index) <- paste0("Pliegue", 1:4)
+indexOut <- lapply(2:5, \(k) which(blk == k));                    names(indexOut) <- names(index)
+sapply(index, length); sapply(indexOut, length)
+cl <- makeCluster(2); registerDoParallel(cl)
+```
+
+## Modelos y su formulación
+
+**Regresión (variable `Humedad_Suelo`, $y$):**
+
+- **Regresión lineal múltiple:** $y_i=\beta_0+\sum_{j=1}^{p}\beta_j x_{ij}+\varepsilon_i$, con $\hat{\boldsymbol\beta}=(X^\top X)^{-1}X^\top y$ (mínimos cuadrados). Cada $\beta_j$ es el cambio esperado en $y$ por unidad de $x_j$, manteniendo las demás constantes.
+- **Random Forest:** promedio de $B$ árboles de regresión entrenados sobre remuestras *bootstrap* y con $m_{try}$ predictores candidatos en cada partición: $\hat f(x)=\frac1B\sum_b T_b(x)$ (Breiman, 2001). Captura no linealidades e interacciones.
+- **Regresión de vectores de soporte (SVR, núcleo RBF):** $\hat f(x)=\sum_i(\alpha_i-\alpha_i^*)K(x_i,x)+b$ con $K(x,x')=\exp(-\sigma\|x-x'\|^2)$ y pérdida $\varepsilon$-insensible; $C$ controla la penalización del error. Se fija $\varepsilon=0{,}01$ m³/m³ porque la variable no está escalada.
+- **K vecinos más cercanos (KNN):** $\hat f(x)=\frac1k\sum_{i\in N_k(x)}y_i$ con distancia euclídea sobre predictores estandarizados.
+
+**Clasificación (`Riesgo_Hidrico` ∈ {Alto, Bajo}):**
+
+- **Regresión logística:** $\log\frac{P(\text{Alto})}{1-P(\text{Alto})}=\beta_0+\sum_j\beta_jx_j$.
+- **Random Forest, SVM (RBF) y KNN:** análogos a los anteriores, con voto/promedio de probabilidades.
+- **Naive Bayes:** $P(\text{Alto}\mid x)\propto P(\text{Alto})\prod_jP(x_j\mid\text{Alto})$, asumiendo independencia condicional entre predictores (supuesto que aquí se viola, pues muchos predictores son derivados entre sí).
+
+**Desbalance de clases.** El riesgo alto es la clase minoritaria (~20 %). Se aplica *down-sampling* de la clase mayoritaria **únicamente dentro de cada pliegue de entrenamiento** (`trainControl(sampling = "down")`), nunca sobre validación ni prueba. SMOTE no se usa para no añadir dependencias (la
+técnica de submuestreo es suficiente y más simple de auditar).
+
+## Métricas
+
+**Regresión.** *RMSE* $=\sqrt{\frac1n\sum(y_i-\hat y_i)^2}$: error típico en m³/m³, penaliza más los errores grandes. *MAE* $=\frac1n\sum|y_i-\hat y_i|$: error absoluto medio, más robusto. $R^2=1-\frac{\sum(y_i-\hat y_i)^2}{\sum(y_i-\bar y)^2}$: fracción de la variabilidad de la humedad que el
+modelo explica *en la prueba* (puede ser negativo si el modelo es peor que predecir la media). Como referencia práctica, se incluye una **línea base de climatología** (predecir la media de entrenamiento de cada municipio–mes): un modelo solo es útil si la supera.
+
+**Clasificación (clase positiva = Alto).** *Precision* = VP/(VP+FP): de las alertas emitidas, cuántas eran reales. ***Recall*** = VP/(VP+FN): de los eventos reales de riesgo alto, cuántos se detectaron; es la métrica prioritaria porque dejar de alertar un caso tiene un
+costo mayor que una alerta de más. *F1* es la media armónica de ambas. *ROC-AUC*: probabilidad de que un caso de riesgo alto reciba mayor puntaje que uno bajo. *PR-AUC*: área bajo la curva precision–recall, más informativa que ROC con clases desbalanceadas (Saito & Rehmsmeier, 2015); su valor de
+referencia es la prevalencia, no 0,5. *Log loss* $=-\frac1n\sum[y\log p+(1-y)\log(1-p)]$: calidad de las probabilidades (el down-sampling las infla, por lo que se interpreta con cautela).
+
+# Predicción supervisada: humedad del suelo
+
+**Objetivo.** Estimar `Humedad_Suelo` (m³/m³) a partir de las condiciones meteorológicas y territoriales del día y de los días anteriores. Se comparan cuatro algoritmos con los mismos datos y la misma validación temporal;
+los hiperparámetros se eligen minimizando el RMSE en la validación de origen móvil.
+
+```{r reg-entrenar}
+ctrl_r <- trainControl(method = "cv", index = index, indexOut = indexOut, savePredictions = "final", allowParallel = TRUE)
+modelos_reg <- en_cache("modelos_reg.rds", {
+  set.seed(SEMILLA)
+  list(
+    lm  = train(x = Xs, y = ys, method = "lm", trControl = ctrl_r),
+    rf  = train(x = Xs, y = ys, method = "rf", trControl = ctrl_r, tuneGrid = data.frame(mtry = c(4, 8, 14)), ntree = 300, importance = TRUE),
+    svr = train(x = Xs, y = ys, method = "svmRadial", trControl = ctrl_r, tuneGrid = expand.grid(sigma = c(.005, .01, .03), C = c(1, 4, 16)), epsilon = 0.01),
+    knn = train(x = Xs, y = ys, method = "knn", trControl = ctrl_r, tuneGrid = data.frame(k = c(5, 10, 20, 40, 80)))
+  )
+})
+nombres_reg <- c(lm = "Regresión lineal", rf = "Random Forest", svr = "SVR (RBF)", knn = "KNN")
+```
+
+```{r reg-evaluar}
+met_reg <- function(obs, pred) c(RMSE = rmse(obs, pred), MAE = mae(obs, pred), R2 = 1 - sum((obs - pred)^2) / sum((obs - mean(obs))^2))
+# Línea base: climatología municipio-mes del entrenamiento
+clim_sm <- tr |> group_by(cod_mpio, Mes) |> summarise(cm = mean(Humedad_Suelo), .groups = "drop")
+clim_sm_m <- tr |> group_by(cod_mpio) |> summarise(cmm = mean(Humedad_Suelo), .groups = "drop")
+pred_base <- te |> left_join(clim_sm, by = c("cod_mpio", "Mes")) |> left_join(clim_sm_m, by = "cod_mpio") |> mutate(p = coalesce(cm, cmm, mean(y_tr))) |> pull(p)
+
+pred_reg <- lapply(modelos_reg, predict, newdata = X_te); pred_reg$base <- pred_base
+tab_reg <- bind_rows(lapply(names(pred_reg), \(n) {
+  m <- modelos_reg[[n]]
+  tibble(Modelo = c(nombres_reg, base = "Línea base: climatología")[[n]],
+         `RMSE validación` = if (is.null(m)) NA else mean(m$resample$RMSE),
+         `RMSE prueba` = met_reg(y_te, pred_reg[[n]])[["RMSE"]], `MAE prueba` = met_reg(y_te, pred_reg[[n]])[["MAE"]], `R² prueba` = met_reg(y_te, pred_reg[[n]])[["R2"]],
+         `Tiempo (s)` = if (is.null(m)) NA else round(m$times$everything[["elapsed"]]),
+         `Hiperparámetros` = if (is.null(m)) "—" else paste(names(m$bestTune), m$bestTune, collapse = ", "))
+}))
+kable(tab_reg, digits = 4, caption = "Comparación de modelos de predicción de humedad del suelo (m³/m³). Validación = media de los 4 pliegues de origen móvil; prueba = 20 % cronológicamente más reciente.")
+```
+
+**Cómo leer la tabla.** Un RMSE de, por ejemplo, 0,05 significa que el error típico es de 0,05 m³/m³, que debe compararse con la desviación estándar de la humedad en la prueba (`r round(sd(y_te), 3)`).
+El $R^2$ indica la proporción de esa variabilidad explicada. Un modelo que no mejora la línea base de climatología no aporta información más allá del «clima normal» de cada mes.
+
+### ¿Por qué el $R^2$ de prueba sale negativo?
+
+Un $R^2$ negativo **no es un error de signo ni de cálculo**: $R^2=1-\mathrm{SSE}/\mathrm{SST}$, donde SST mide la dispersión de la humedad *observada en la prueba* alrededor de su propia media. Si $R^2<0$, el modelo comete más error que un «modelo» que predijera siempre la media de la prueba. El error cuadrático medio se descompone en
+$\mathrm{MSE}=\text{sesgo}^2+\mathrm{Var}(e)$, y por tanto $R^2=1-\dfrac{\text{sesgo}^2+\mathrm{Var}(e)}{\mathrm{Var}(y)}$: basta un sesgo sistemático moderado para volverlo negativo cuando $\mathrm{Var}(y)$ de la prueba es pequeña.
+
+```{r r2-negativo}
+tibble(Conjunto = c("Entrenamiento", "Prueba"), n = c(length(y_tr), length(y_te)), `Humedad media` = c(mean(y_tr), mean(y_te)), `Desv. estándar` = c(sd(y_tr), sd(y_te)),
+       Desde = c(min(tr$fecha), min(te$fecha)), Hasta = c(max(tr$fecha), max(te$fecha))) |> kable(digits = 3, format.args = list(big.mark = "."), caption = "La prueba es un tramo corto y distinto del entrenamiento.")
+diag_r2 <- bind_rows(lapply(names(pred_reg), \(n) { e <- y_te - pred_reg[[n]]
+  tibble(Modelo = c(nombres_reg, base = "Línea base: climatología")[[n]], `Sesgo medio (obs − pred)` = mean(e), `% del MSE debido al sesgo` = 100 * mean(e)^2 / mean(e^2),
+         `Correlación r (obs, pred)` = cor(y_te, pred_reg[[n]]), `RMSE sin sesgo (solo diagnóstico)` = sd(e), `R² prueba` = 1 - sum(e^2) / sum((y_te - mean(y_te))^2)) }))
+kable(diag_r2, digits = 3, caption = "Descomposición del error en la prueba. Un sesgo negativo significa que el modelo sobrestima la humedad.")
+```
+
+**Lectura.** El periodo de prueba (`r format(min(te$fecha))` a `r format(max(te$fecha))`) es un tramo corto y **más seco** que el entrenamiento (media `r round(mean(y_te), 3)` frente a `r round(mean(y_tr), 3)` m³/m³), con poca dispersión propia (σ = `r round(sd(y_te), 3)`), de modo que el SST es pequeño. Los modelos **sobrestiman** de forma sistemática la humedad (sesgo entre
+`r round(min(diag_r2$"Sesgo medio (obs − pred)"[diag_r2$Modelo != "Línea base: climatología"]), 3)` y `r round(max(diag_r2$"Sesgo medio (obs − pred)"[diag_r2$Modelo != "Línea base: climatología"]), 3)`): entre el `r round(min(diag_r2$"% del MSE debido al sesgo"[diag_r2$Modelo != "Línea base: climatología"]))` % y el `r round(max(diag_r2$"% del MSE debido al sesgo"[diag_r2$Modelo != "Línea base: climatología"]))` % de su error cuadrático es sesgo, no ruido.
+Aun así, la correlación con lo observado es positiva (columna *r*), es decir, **los modelos captan la dirección de las variaciones pero no el nivel**. Esto es un **cambio de régimen/estacionalidad no cubierto por el entrenamiento** (marzo casi no está representado en las ventanas disponibles), agravado por la cobertura parcial de SMAP; no se «corrige» manipulando la partición. La columna *RMSE sin sesgo* es solo un diagnóstico (no se conoce de antemano el sesgo en uso real). Con la serie SMAP completa se espera que este problema se atenúe.
+
+```{r reg-grafico, fig.height=4.2}
+tab_reg |> select(Modelo, RMSE = `RMSE prueba`, MAE = `MAE prueba`, `R²` = `R² prueba`) |> pivot_longer(-Modelo, names_to = "Métrica") |>
+  ggplot(aes(reorder(Modelo, value), value, fill = Modelo)) + geom_col(show.legend = FALSE) + coord_flip() + facet_wrap(~Métrica, scales = "free_x") +
+  geom_text(aes(label = sprintf("%.3f", value)), hjust = 1.1, color = "white", size = 3) + scale_fill_brewer(palette = "Set2") +
+  labs(title = "Métricas de regresión en la prueba", x = NULL, y = NULL)
+```
+
+# Clasificación supervisada: riesgo hídrico
+
+**Objetivo.** Clasificar cada observación como riesgo **Alto** (humedad ≤ percentil 20 municipio–mes) o **Bajo**, usando solo predictores meteorológicos y territoriales (la humedad del suelo **no** es predictor).
+Se optimiza el área ROC dentro de la validación temporal, con down-sampling dentro de cada pliegue de entrenamiento. La clase positiva es *Alto*, de modo que la sensibilidad es el *recall* del riesgo alto.
+
+```{r cls-entrenar}
+ctrl_c <- trainControl(method = "cv", index = index, indexOut = indexOut, classProbs = TRUE, summaryFunction = twoClassSummary,
+                       sampling = "down", savePredictions = "final", allowParallel = TRUE)
+modelos_cls <- en_cache("modelos_cls.rds", {
+  set.seed(SEMILLA)
+  intentar <- function(...) tryCatch(train(...), error = function(e) { message("Fallo: ", conditionMessage(e)); NULL })
+  list(
+    glm = intentar(x = Xs, y = cs, method = "glm", family = binomial, metric = "ROC", trControl = ctrl_c),
+    rf  = intentar(x = Xs, y = cs, method = "rf", metric = "ROC", trControl = ctrl_c, tuneGrid = data.frame(mtry = c(4, 8, 14)), ntree = 300, importance = TRUE),
+    svm = intentar(x = Xs, y = cs, method = "svmRadial", metric = "ROC", trControl = ctrl_c, tuneGrid = expand.grid(sigma = c(.005, .01, .03), C = c(1, 4, 16))),
+    knn = intentar(x = Xs, y = cs, method = "knn", metric = "ROC", trControl = ctrl_c, tuneGrid = data.frame(k = c(5, 15, 30, 60))),
+    nb  = intentar(x = Xs, y = cs, method = "nb", metric = "ROC", trControl = ctrl_c, tuneGrid = expand.grid(fL = c(0, 1), usekernel = c(TRUE, FALSE), adjust = 1))
+  )
+})
+modelos_cls <- Filter(Negate(is.null), modelos_cls)
+nombres_cls <- c(glm = "Regresión logística", rf = "Random Forest", svm = "SVM (RBF)", knn = "KNN", nb = "Naive Bayes")
+```
+
+```{r cls-evaluar}
+met_cls <- function(obs, prob, umbral = 0.5) {
+  prob <- ifelse(is.na(prob), 0.5, pmin(pmax(prob, 1e-6), 1 - 1e-6))
+  pred <- factor(ifelse(prob >= umbral, "Alto", "Bajo"), levels = c("Alto", "Bajo"))
+  cm <- confusionMatrix(pred, obs, positive = "Alto")
+  y1 <- as.numeric(obs == "Alto")
+  tp <- cm$table["Alto", "Alto"]; fp <- cm$table["Alto", "Bajo"]; fn <- cm$table["Bajo", "Alto"]
+  prec <- ifelse(tp + fp == 0, NA, tp / (tp + fp)); rec <- tp / (tp + fn)
+  c(Accuracy = unname(cm$overall["Accuracy"]), Precision = prec, Recall = rec, F1 = 2 * prec * rec / (prec + rec),
+    `ROC-AUC` = as.numeric(pROC::auc(pROC::roc(obs, prob, levels = c("Bajo", "Alto"), direction = "<", quiet = TRUE))),
+    `PR-AUC` = PRROC::pr.curve(scores.class0 = prob[y1 == 1], scores.class1 = prob[y1 == 0])$auc.integral, `Log loss` = Metrics::logLoss(y1, prob))
+}
+prob_cls <- lapply(modelos_cls, \(m) tryCatch(predict(m, X_te, type = "prob")[, "Alto"], error = function(e) NULL))
+ok_p <- sapply(prob_cls, \(p) !is.null(p) && length(p) == length(c_te) && mean(is.na(p)) < 0.05)
+if (any(!ok_p)) cat("**Modelos descartados de la evaluación por no producir probabilidades válidas para toda la prueba:**", paste(nombres_cls[names(ok_p)[!ok_p]], collapse = ", "), "\n\n")
+prob_cls <- prob_cls[ok_p]; modelos_cls <- modelos_cls[names(prob_cls)]
+tab_cls <- bind_rows(lapply(names(prob_cls), \(n) {
+  m <- modelos_cls[[n]]
+  tibble(Modelo = nombres_cls[[n]], `ROC validación` = max(m$results$ROC), as_tibble(as.list(met_cls(c_te, prob_cls[[n]]))),
+         `Tiempo (s)` = round(m$times$everything[["elapsed"]]))
+}))
+cat("Prevalencia de riesgo alto: entrenamiento", round(100 * mean(c_tr == "Alto"), 1), "% | prueba", round(100 * mean(c_te == "Alto"), 1), "%  (PR-AUC de un clasificador al azar ≈ prevalencia en prueba)\n")
+kable(tab_cls, digits = 3, caption = "Comparación de clasificadores en la prueba (umbral de probabilidad 0,5; clase positiva = Alto).")
+```
+
+**Cómo leer la tabla.** El *Accuracy* por sí solo engaña cuando una clase domina: un modelo que siempre dijera «Bajo» tendría una exactitud alta y recall nulo. Por eso se miran el *Recall* (¿cuántos riesgos altos reales se detectan?),
+la *Precision* (¿cuántas alertas fueron correctas?) y el *PR-AUC*. Las probabilidades de los modelos entrenados con down-sampling están sesgadas hacia la clase minoritaria, lo que eleva el *log loss*; el ranking (AUC) no se ve afectado.
+
+# Modelo de regresión lineal múltiple
+
+Esta sección desarrolla el modelo lineal como herramienta **explicativa**: su valor es que cada coeficiente tiene una interpretación física directa. Se ajusta con **todo el entrenamiento** y las variables en sus unidades originales
+(winsorizadas con los límites de entrenamiento).
+
+## Formulación
+
+$$
+\text{Humedad\_Suelo}_{it}=\beta_0+\beta_1\,\text{Precip}_{it}+\beta_2\,\text{Precip\_Acum}_{it}+\beta_3\,\text{Temp}_{it}+\beta_4\,\text{HR}_{it}+\beta_5\,\text{Rad}_{it}+\dots+\varepsilon_{it}
+$$
+
+donde $i$ indexa municipio y $t$ el día; $\varepsilon_{it}\sim(0,\sigma^2)$. Los coeficientes se estiman por mínimos cuadrados ordinarios.
+
+## Multicolinealidad (VIF) y selección de variables
+
+Muchos predictores son derivados entre sí (la lluvia acumulada de 30 días contiene la de 7 días; la temperatura media es casi el promedio de la máxima y la mínima). Con predictores muy correlacionados, los coeficientes se vuelven inestables y de signo engañoso.
+El **factor de inflación de la varianza** $VIF_j=1/(1-R_j^2)$ mide cuánto aumenta la varianza del coeficiente $j$ por colinealidad; se considera problemático un VIF > 10. Se parte de todos los predictores numéricos y se elimina iterativamente el de mayor VIF hasta que todos queden ≤ 10.
+
+```{r lm-vif}
+trw <- winsor(tr); tew <- winsor(te)
+cand <- vars_num; log_quita <- tibble(Variable = character(), VIF = numeric())
+m0 <- lm(reformulate(cand, "Humedad_Suelo"), trw); alias <- names(coef(m0))[is.na(coef(m0))]; cand <- setdiff(cand, alias)
+vif_ini <- car::vif(lm(reformulate(cand, "Humedad_Suelo"), trw))
+repeat {
+  v <- car::vif(lm(reformulate(cand, "Humedad_Suelo"), trw)); if (max(v) <= 10) break
+  log_quita <- add_row(log_quita, Variable = names(which.max(v)), VIF = max(v)); cand <- setdiff(cand, names(which.max(v)))
+}
+cat("Variables eliminadas por colinealidad (en orden):\n"); kable(log_quita, digits = 1)
+m_lm <- lm(reformulate(cand, "Humedad_Suelo"), trw)
+kable(tibble(Variable = names(car::vif(m_lm)), `VIF final` = as.numeric(car::vif(m_lm))), digits = 2, caption = "VIF del modelo final.")
+```
+
+## Coeficientes, significancia y ajuste
+
+```{r lm-resumen}
+glance_lm <- broom::glance(m_lm)
+coefs <- broom::tidy(m_lm, conf.int = TRUE) |> filter(term != "(Intercept)") |>
+  mutate(`Beta estandarizado` = estimate * sapply(term, \(t) sd(trw[[t]])) / sd(trw$Humedad_Suelo)) |>
+  arrange(desc(abs(`Beta estandarizado`)))
+kable(coefs |> transmute(Variable = term, Coeficiente = estimate, `Error est.` = std.error, `IC 95 % inf.` = conf.low, `IC 95 % sup.` = conf.high, `Valor p` = p.value, `Beta estandarizado`),
+      digits = 5, caption = "Coeficientes del modelo lineal final (unidades originales) ordenados por magnitud estandarizada.")
+cat(sprintf("R² = %.3f | R² ajustado = %.3f | Error estándar residual = %.4f m³/m³ | n = %s | F = %.0f (p < 0,001)\n",
+            glance_lm$r.squared, glance_lm$adj.r.squared, glance_lm$sigma, format(glance_lm$nobs, big.mark = "."), glance_lm$statistic))
+```
+
+**Interpretación.** El coeficiente de cada variable es el cambio promedio en la humedad del suelo (m³/m³) por unidad de la variable, *manteniendo las demás constantes*. El «beta estandarizado» (cambio en desviaciones estándar de la humedad por cada desviación estándar del predictor)
+permite comparar la importancia relativa entre variables con unidades distintas. Con más de cien mil observaciones casi cualquier coeficiente resulta «significativo» ($p<0{,}05$); por eso importa más el **tamaño del efecto** y el intervalo de confianza que el valor p.
+El $R^2$ ajustado penaliza la inclusión de variables sin aporte real. Estas relaciones son **asociaciones estadísticas, no causalidad**.
+
+## Análisis de residuos
+
+```{r lm-residuos, fig.height=6.5}
+set.seed(SEMILLA); ms <- sample(nrow(trw), 5000)
+rs <- tibble(aj = fitted(m_lm)[ms], res = resid(m_lm)[ms], est = rstandard(m_lm)[ms])
+g1 <- ggplot(rs, aes(aj, res)) + geom_point(alpha = .25, size = .6) + geom_hline(yintercept = 0, color = "red") + geom_smooth(se = FALSE, color = "#264653") + labs(title = "Residuos vs. ajustados", x = "Ajustados (m³/m³)", y = "Residuos")
+g2 <- ggplot(rs, aes(sample = est)) + stat_qq(alpha = .3, size = .6) + stat_qq_line(color = "red") + labs(title = "Q-Q de residuos estandarizados", x = "Cuantiles teóricos", y = "Cuantiles observados")
+g3 <- ggplot(rs, aes(aj, sqrt(abs(est)))) + geom_point(alpha = .25, size = .6) + geom_smooth(se = FALSE, color = "#264653") + labs(title = "Escala-ubicación (homocedasticidad)", x = "Ajustados", y = "√|residuo estand.|")
+g4 <- ggplot(rs, aes(res)) + geom_histogram(bins = 40, fill = "#a8dadc") + labs(title = "Histograma de residuos", x = "Residuo (m³/m³)", y = "Frecuencia")
+grid.arrange(g1, g2, g3, g4, ncol = 2)
+r_lag <- trw |> mutate(res = resid(m_lm)) |> arrange(cod_mpio, fecha) |> group_by(cod_mpio) |> mutate(prev = lag(res), dif = as.numeric(fecha - lag(fecha))) |> ungroup() |> filter(dif == 1)
+tibble(Prueba = c("Breusch-Pagan / varianza no constante (car::ncvTest)", "Shapiro-Wilk (muestra de 5.000 residuos)", "Autocorrelación de residuos de días consecutivos (r de Pearson)"),
+       Estadístico = c(car::ncvTest(m_lm)$ChiSquare, unname(shapiro.test(rs$res)$statistic), cor(r_lag$res, r_lag$prev)),
+       `Valor p` = c(car::ncvTest(m_lm)$p, shapiro.test(rs$res)$p.value, NA)) |> kable(digits = 4)
+```
+
+**Diagnóstico.** Con esta cantidad de datos, las pruebas formales rechazan homocedasticidad y normalidad aun ante desviaciones pequeñas, así que se interpretan junto con los gráficos. La autocorrelación positiva entre residuos de días consecutivos
+indica que las observaciones **no son independientes** (la humedad tiene memoria): los errores estándar de la tabla son *optimistas* y los valores p deben leerse como orientativos. Un modelo con errores robustos por municipio o con términos autorregresivos mitigaría esto (línea de trabajo futura).
+
+## Capacidad predictiva en la prueba
+
+```{r lm-prueba}
+pred_lm_full <- predict(m_lm, tew)
+tab_lm <- bind_rows(tibble(Modelo = "Lineal (entrenamiento completo, VIF ≤ 10)", as_tibble(as.list(met_reg(y_te, pred_lm_full)))),
+                    tibble(Modelo = "Lineal vía caret (submuestra, todos los predictores)", as_tibble(as.list(met_reg(y_te, pred_reg$lm)))))
+kable(tab_lm, digits = 4, caption = "Desempeño del modelo lineal en la prueba.")
+```
+
+**Ventajas y limitaciones frente a los modelos no lineales.** *Ventajas:* interpretación directa de cada efecto, inferencia estadística, costo computacional mínimo y facilidad de comunicar a una UMATA. *Limitaciones:* supone relaciones lineales y aditivas, mientras que la
+respuesta del suelo a la lluvia es saturante (con el suelo húmedo, más lluvia ya no aumenta la humedad) y depende de interacciones (lluvia × temperatura × zona); además es sensible a la colinealidad y no modela la dependencia temporal. En la sección de comparación se cuantifica cuánta precisión se gana con modelos no lineales.
+
+# Validación y evaluación
+
+## Selección de hiperparámetros y regla de selección del modelo
+
+Los modelos se comparan **primero con la validación de origen móvil** (no con la prueba, para no «afinar sobre el examen final») y la prueba confirma el resultado. Se aplica la **regla del error estándar**: entre los modelos cuyo desempeño en validación
+está dentro de un error estándar del mejor, se prefiere el más simple (Hastie et al., 2009), usando el orden de complejidad lineal/logística < Naive Bayes/KNN < Random Forest < SVM/SVR.
+
+```{r seleccion}
+complej_reg <- c(lm = 1, knn = 2, rf = 3, svr = 4); complej_cls <- c(glm = 1, nb = 2, knn = 2, rf = 3, svm = 4)
+sel_1se <- function(mods, metrica, minimizar, complej) {
+  r <- sapply(mods, \(m) { v <- m$resample[[metrica]]; c(media = mean(v), se = sd(v) / sqrt(length(v))) }) |> t() |> as.data.frame()
+  mejor <- if (minimizar) which.min(r$media) else which.max(r$media)
+  ok <- if (minimizar) r$media <= r$media[mejor] + r$se[mejor] else r$media >= r$media[mejor] - r$se[mejor]
+  cand <- names(mods)[ok]; elegido <- cand[which.min(complej[cand])]
+  list(tabla = r, mejor_absoluto = names(mods)[mejor], elegido = elegido)
+}
+sel_reg <- sel_1se(modelos_reg, "RMSE", TRUE, complej_reg)
+sel_cls <- sel_1se(modelos_cls, "ROC", FALSE, complej_cls)
+cat("Regresión: mejor RMSE de validación =", nombres_reg[sel_reg$mejor_absoluto], "| elegido por regla de 1 SE =", nombres_reg[sel_reg$elegido], "\n")
+cat("Clasificación: mejor ROC de validación =", nombres_cls[sel_cls$mejor_absoluto], "| elegido por regla de 1 SE =", nombres_cls[sel_cls$elegido], "\n")
+mejor_reg <- sel_reg$elegido; mejor_cls <- sel_cls$elegido
+```
+
+## Regresión: observados vs. predichos y residuos
+
+```{r val-reg, fig.height=6.2}
+dfp <- bind_rows(lapply(names(modelos_reg), \(n) tibble(Modelo = nombres_reg[[n]], obs = y_te, pred = pred_reg[[n]])))
+ggplot(dfp, aes(obs, pred)) + geom_bin_2d(bins = 60) + geom_abline(color = "red") + scale_fill_viridis_c(trans = "log10", option = "D") + facet_wrap(~Modelo) + coord_equal(xlim = c(0, .6), ylim = c(0, .6)) +
+  labs(title = "Humedad del suelo: observada vs. predicha (prueba)", subtitle = "La línea roja es el ajuste perfecto", x = "Observada (m³/m³)", y = "Predicha (m³/m³)", fill = "Obs.")
+dfr <- dfp |> mutate(res = obs - pred)
+ggplot(dfr, aes(Modelo, res, fill = Modelo)) + geom_boxplot(outlier.alpha = .1, show.legend = FALSE) + geom_hline(yintercept = 0, color = "red") + scale_fill_brewer(palette = "Set2") +
+  labs(title = "Distribución de los residuos en la prueba (observado − predicho)", x = NULL, y = "Residuo (m³/m³)")
+```
+
+Un buen modelo muestra una nube alrededor de la diagonal y residuos centrados en cero. Si los residuos tienen sesgo (mediana distinta de 0) el modelo subestima o sobreestima sistemáticamente; en la prueba esto puede reflejar un **cambio de régimen** (periodos más secos o húmedos que el
+entrenamiento), no solo un defecto del algoritmo.
+
+## Clasificación: matrices de confusión, ROC y precision–recall
+
+```{r val-cls-cm, fig.height=5}
+cm_df <- bind_rows(lapply(names(prob_cls), \(n) {
+  pr <- factor(ifelse(prob_cls[[n]] >= .5, "Alto", "Bajo"), levels = c("Alto", "Bajo"))
+  as.data.frame(table(Predicho = pr, Observado = c_te)) |> mutate(Modelo = nombres_cls[[n]], pct = 100 * Freq / sum(Freq))
+}))
+ggplot(cm_df, aes(Observado, Predicho, fill = Freq)) + geom_tile() + geom_text(aes(label = format(Freq, big.mark = ".")), size = 3.2) + facet_wrap(~Modelo) +
+  scale_fill_gradient(low = "white", high = "#e76f51") + scale_y_discrete(limits = c("Bajo", "Alto")) + labs(title = "Matrices de confusión en la prueba (umbral 0,5)", fill = "Casos")
+```
+
+```{r val-cls-curvas, fig.height=4.6, fig.width=10}
+roc_df <- bind_rows(lapply(names(prob_cls), \(n) { r <- pROC::roc(c_te, prob_cls[[n]], levels = c("Bajo", "Alto"), direction = "<", quiet = TRUE)
+  tibble(Modelo = nombres_cls[[n]], fpr = 1 - r$specificities, tpr = r$sensitivities) }))
+pr_df <- bind_rows(lapply(names(prob_cls), \(n) { y1 <- c_te == "Alto"; p <- pmin(pmax(ifelse(is.na(prob_cls[[n]]), .5, prob_cls[[n]]), 1e-6), 1 - 1e-6)
+  pc <- PRROC::pr.curve(scores.class0 = p[y1], scores.class1 = p[!y1], curve = TRUE); tibble(Modelo = nombres_cls[[n]], recall = pc$curve[, 1], precision = pc$curve[, 2]) }))
+g_roc <- ggplot(roc_df, aes(fpr, tpr, color = Modelo)) + geom_line() + geom_abline(linetype = 2, color = "grey50") + labs(title = "Curvas ROC (prueba)", x = "1 − especificidad", y = "Sensibilidad (recall)")
+g_pr  <- ggplot(pr_df, aes(recall, precision, color = Modelo)) + geom_line() + geom_hline(yintercept = mean(c_te == "Alto"), linetype = 2, color = "grey50") +
+  labs(title = "Curvas precision–recall (prueba)", subtitle = "Línea punteada = prevalencia (modelo al azar)", x = "Recall", y = "Precision")
+grid.arrange(g_roc, g_pr, ncol = 2)
+```
+
+**Umbral de decisión.** Como el *recall* del riesgo alto es la prioridad, el umbral de 0,5 no es necesariamente el mejor. Se elige para el clasificador seleccionado el umbral que maximiza $F_2$ (que pondera el recall dos veces más que la precision)
+**sobre las predicciones fuera de muestra de la validación**, es decir, sin mirar la prueba:
+
+```{r umbral}
+oof <- modelos_cls[[mejor_cls]]$pred; oof <- oof[oof$mtry == modelos_cls[[mejor_cls]]$bestTune$mtry | !"mtry" %in% names(oof), ]
+f2 <- function(obs, prob, u) { p <- prob >= u; tp <- sum(p & obs == "Alto"); fp <- sum(p & obs != "Alto"); fn <- sum(!p & obs == "Alto"); if (tp == 0) return(0); pr <- tp / (tp + fp); rc <- tp / (tp + fn); 5 * pr * rc / (4 * pr + rc) }
+ug <- seq(.05, .95, .01); f2v <- sapply(ug, \(u) f2(oof$obs, oof$Alto, u)); UMBRAL <- ug[which.max(f2v)]
+cat("Umbral elegido (F2 máximo en validación):", UMBRAL, "\n")
+cmp <- bind_rows(tibble(Umbral = "0,5", as_tibble(as.list(met_cls(c_te, prob_cls[[mejor_cls]], .5)))), tibble(Umbral = paste0(UMBRAL, " (F2 en validación)"), as_tibble(as.list(met_cls(c_te, prob_cls[[mejor_cls]], UMBRAL)))))
+kable(cmp |> select(Umbral, Accuracy, Precision, Recall, F1), digits = 3, caption = paste("Efecto del umbral en el clasificador seleccionado:", nombres_cls[[mejor_cls]]))
+```
+
+## ¿Cuánto optimismo introduce una partición aleatoria?
+
+Se repite un mismo ejercicio (Random Forest sobre 15.000 observaciones muestreadas de todo el periodo) con una partición aleatoria 80/20 estratificada (`createDataPartition`) y con la partición cronológica:
+
+```{r optimismo}
+set.seed(SEMILLA)
+ms <- d[sample(nrow(d), 15000), ]; Xm <- prep_x(ms); ym <- ms$Humedad_Suelo
+mtry_rf <- modelos_reg$rf$bestTune$mtry
+ev <- function(itr, ite) { f <- randomForest(Xm[itr, ], ym[itr], ntree = 200, mtry = mtry_rf); met_reg(ym[ite], predict(f, Xm[ite, ])) }
+ia <- createDataPartition(ym, p = .8, list = FALSE)[, 1]
+res_opt <- bind_rows(tibble(Partición = "Aleatoria 80/20", as_tibble(as.list(ev(ia, setdiff(seq_along(ym), ia))))),
+                     tibble(Partición = "Cronológica (corte del 80 % de las fechas)", as_tibble(as.list(ev(which(ms$fecha <= CORTE), which(ms$fecha > CORTE))))))
+kable(res_opt, digits = 4)
+```
+
+La partición aleatoria suele dar un error menor porque el modelo ve, en entrenamiento, días vecinos (misma semana, mismo municipio) de los de prueba. La cronológica refleja el desempeño esperado en el uso real y es la que se adopta para todas las conclusiones.
+
+## Generalización espacial: ¿y en municipios que el modelo no vio?
+
+Además de la extrapolación en el tiempo, se evalúa la extrapolación en el espacio: validación **dejando fuera grupos de municipios** (5 grupos aleatorios). El modelo se entrena con la submuestra de los municipios restantes y se evalúa en el periodo de prueba de los municipios excluidos.
+
+```{r espacial}
+set.seed(SEMILLA)
+muns <- unique(tr$cod_mpio); grupo <- setNames(sample(rep(1:5, length.out = length(muns))), muns)
+g_sub <- grupo[tr$cod_mpio[idx_sub]]; g_te <- grupo[te$cod_mpio]
+esp <- bind_rows(lapply(1:5, \(g) {
+  f <- randomForest(Xs[g_sub != g, ], ys[g_sub != g], ntree = 200, mtry = mtry_rf); p <- predict(f, X_te[g_te == g, ])
+  l <- lm(ys[g_sub != g] ~ ., data = Xs[g_sub != g, ]); pl <- predict(l, X_te[g_te == g, ])
+  tibble(Grupo = g, n_prueba = sum(g_te == g), RMSE_RF = rmse(y_te[g_te == g], p), R2_RF = met_reg(y_te[g_te == g], p)[["R2"]], RMSE_LM = rmse(y_te[g_te == g], pl), R2_LM = met_reg(y_te[g_te == g], pl)[["R2"]])
+}))
+kable(esp, digits = 3, caption = "Validación por grupos de municipios excluidos (extrapolación en tiempo y espacio).")
+cat("RMSE RF promedio con municipios no vistos:", round(mean(esp$RMSE_RF), 4), "vs. con municipios vistos (prueba temporal):", round(tab_reg$`RMSE prueba`[tab_reg$Modelo == "Random Forest"], 4), "\n")
+```
+
+## Análisis de sensibilidad
+
+### Umbral del percentil
+
+El percentil 20 es una convención (los monitores de sequía por percentiles usan umbrales similares; Svoboda et al., 2002), no una verdad física. Se evalúa cuánto cambia el problema con los percentiles 10, 20 y 30 (regresión logística y Random Forest sobre la submuestra, con down-sampling):
+
+```{r sens-percentil}
+set.seed(SEMILLA)
+sens <- bind_rows(lapply(c(.10, .20, .30), \(p) {
+  u <- calc_umbral(tr, p); trp <- etiquetar(tr, u); tep <- etiquetar(te, u)
+  ci <- trp$Riesgo_Hidrico[idx_sub]; ct <- tep$Riesgo_Hidrico
+  ds <- downSample(Xs, ci, yname = "Riesgo")
+  g <- suppressWarnings(glm(Riesgo ~ ., data = ds, family = binomial)); pg <- predict(g, X_te, type = "response"); pg <- 1 - pg  # glm modela el 2.º nivel (Bajo)
+  f <- randomForest(Riesgo ~ ., data = ds, ntree = 200, mtry = mtry_rf); pf <- predict(f, X_te, type = "prob")[, "Alto"]
+  bind_rows(tibble(Percentil = p, Modelo = "Logística", Prev_prueba = mean(ct == "Alto"), as_tibble(as.list(met_cls(ct, pg))[c("Recall", "Precision", "ROC-AUC", "PR-AUC")])),
+            tibble(Percentil = p, Modelo = "Random Forest", Prev_prueba = mean(ct == "Alto"), as_tibble(as.list(met_cls(ct, pf))[c("Recall", "Precision", "ROC-AUC", "PR-AUC")])))
+}))
+kable(sens, digits = 3, caption = "Sensibilidad al percentil que define el riesgo alto (prueba).")
+```
+
+### Filtro de calidad SMAP estricto
+
+Se repite el Random Forest y el modelo lineal usando como respuesta la humedad calculada **solo con recuperaciones de calidad recomendada** (bit 0 = 0):
+
+```{r sens-estricto}
+set.seed(SEMILLA)
+de <- d |> filter(!is.na(Humedad_Suelo_Estricto)); tre <- filter(de, conjunto == "Entrenamiento"); tee <- filter(de, conjunto == "Prueba")
+if (nrow(tre) > 300 && nrow(tee) > 100) {
+  Xe_tr <- prep_x(tre); Xe_te <- prep_x(tee); ie <- sample(nrow(Xe_tr), min(N_SUB, nrow(Xe_tr)))
+  fe <- randomForest(Xe_tr[ie, ], tre$Humedad_Suelo_Estricto[ie], ntree = 300, mtry = mtry_rf); le <- lm(tre$Humedad_Suelo_Estricto ~ ., data = Xe_tr)
+  kable(bind_rows(tibble(Respuesta = "Filtro principal", Modelo = "Random Forest", n_entrena = nrow(tr), n_prueba = nrow(te), as_tibble(as.list(met_reg(y_te, pred_reg$rf)))),
+                  tibble(Respuesta = "Filtro estricto", Modelo = "Random Forest", n_entrena = nrow(tre), n_prueba = nrow(tee), as_tibble(as.list(met_reg(tee$Humedad_Suelo_Estricto, predict(fe, Xe_te))))),
+                  tibble(Respuesta = "Filtro estricto", Modelo = "Lineal", n_entrena = nrow(tre), n_prueba = nrow(tee), as_tibble(as.list(met_reg(tee$Humedad_Suelo_Estricto, predict(le, Xe_te)))))),
+        digits = 4, format.args = list(big.mark = "."), caption = "Sensibilidad al filtro de calidad de SMAP.")
+} else cat("Con el filtro estricto quedan muy pocas observaciones para reentrenar (", nrow(tre), "entrenamiento).\n")
+```
+
+## Contraste con IDEAM {#ideam}
+
+Las estaciones del IDEAM (datos abiertos en datos.gov.co) permiten comprobar si la precipitación de POWER —una cuadrícula de ~50 km— es una aproximación razonable a lo que miden los pluviómetros. Los datos se agregan a nivel diario en el servidor y se promedian por municipio.
+
+```{r ideam}
+fi <- list.files("data/raw/ideam", "^prec_.*rds$", full.names = TRUE)
+if (length(fi) >= 3) {
+  norm <- \(x) trimws(gsub("[^A-Z0-9 ]", "", toupper(iconv(x, to = "ASCII//TRANSLIT"))))
+  leer <- \(pref) bind_rows(lapply(list.files("data/raw/ideam", paste0("^", pref, "_.*rds$"), full.names = TRUE), \(f) { r <- readRDS(f); if (length(r)) r else NULL })) |>
+    mutate(fecha = as.Date(substr(dia, 1, 10)), v = as.numeric(v), n = as.integer(n))
+  mm <- st_drop_geometry(mun) |> transmute(cod_mpio, mun_n = norm(Municipio))
+  pw <- readRDS("data/processed/power_diario.rds")
+  comp <- function(pref, var_pw, agregar = mean) {
+    x <- leer(pref); if (!nrow(x)) return(NULL)
+    x <- x |> group_by(codigoestacion) |> filter(n >= 0.9 * as.numeric(names(which.max(table(n))))) |> ungroup() |>   # días con ≥90 % de registros esperados
+      mutate(mun_n = norm(municipio)) |> inner_join(mm, by = "mun_n") |> group_by(cod_mpio, fecha) |> summarise(ideam = mean(v), n_est = n(), .groups = "drop")
+    inner_join(x, pw[c("cod_mpio", "fecha", var_pw)] |> rename(power = !!var_pw), by = c("cod_mpio", "fecha")) |> filter(!is.na(power))
+  }
+  ci <- comp("prec", "Precipitacion")
+  if (!is.null(ci) && nrow(ci) > 100) {
+    sem <- ci |> mutate(sem = floor_date(fecha, "week")) |> group_by(cod_mpio, sem) |> filter(n() == 7) |> summarise(ideam = sum(ideam), power = sum(power), .groups = "drop")
+    kable(tibble(`Municipios con estaciones` = n_distinct(ci$cod_mpio), `Días municipio` = nrow(ci), `Correlación diaria` = cor(ci$ideam, ci$power), `Correlación semanal (suma 7 d)` = cor(sem$ideam, sem$power),
+                 `Sesgo medio POWER − IDEAM (mm/día)` = mean(ci$power - ci$ideam)), digits = 3, caption = "Contraste de precipitación POWER vs. IDEAM.")
+    ggplot(sem, aes(ideam, power)) + geom_bin_2d(bins = 50) + geom_abline(color = "red") + scale_fill_viridis_c(trans = "log10") + labs(title = "Precipitación semanal: POWER vs. estaciones IDEAM", x = "IDEAM (mm/semana)", y = "POWER (mm/semana)", fill = "Casos")
+  } else cat("Datos IDEAM insuficientes para el contraste de precipitación.\n")
+} else cat("**Nota:** la descarga de IDEAM por el servicio de datos abiertos no se completó para esta compilación (el servidor responde con tiempos de espera elevados); por tanto, el contraste con estaciones se declara como limitación y NASA POWER se usa sin validación local.\n")
+```
+
+# Comparación y selección de modelos
+
+## Regresión
+
+```{r comp-reg}
+comp_reg <- tab_reg |> filter(Modelo != "Línea base: climatología") |> mutate(Clave = names(nombres_reg)[match(Modelo, nombres_reg)],
+  Interpretabilidad = c(lm = "Alta", rf = "Media (importancias)", svr = "Baja", knn = "Baja")[Clave], Complejidad = complej_reg[Clave]) |>
+  mutate(Elegido = ifelse(Clave == mejor_reg, "◄ seleccionado", "")) |> select(-Clave)
+kable(comp_reg, digits = 4, caption = "Comparación integral de los modelos de regresión.")
+```
+
+**Selección.** El modelo elegido por la regla del error estándar en validación es **`r nombres_reg[[mejor_reg]]`**. Su RMSE en la prueba es `r round(met_reg(y_te, pred_reg[[mejor_reg]])[["RMSE"]], 4)` m³/m³ y su $R^2$ es `r round(met_reg(y_te, pred_reg[[mejor_reg]])[["R2"]], 3)`;
+la línea base de climatología logra RMSE `r round(met_reg(y_te, pred_base)[["RMSE"]], 4)` y $R^2$ `r round(met_reg(y_te, pred_base)[["R2"]], 3)`, y el modelo lineal `r round(met_reg(y_te, pred_reg$lm)[["RMSE"]], 4)` y `r round(met_reg(y_te, pred_reg$lm)[["R2"]], 3)`.
+
+```{r comp-lineal, fig.height=4.4}
+nl <- tibble(Modelo = c("Lineal", "Random Forest", "SVR (RBF)"), RMSE = c(rmse(y_te, pred_reg$lm), rmse(y_te, pred_reg$rf), rmse(y_te, pred_reg$svr)),
+             R2 = c(met_reg(y_te, pred_reg$lm)[["R2"]], met_reg(y_te, pred_reg$rf)[["R2"]], met_reg(y_te, pred_reg$svr)[["R2"]]))
+rr <- bind_rows(tibble(Modelo = "Lineal", res = y_te - pred_reg$lm), tibble(Modelo = "Random Forest", res = y_te - pred_reg$rf), tibble(Modelo = "SVR (RBF)", res = y_te - pred_reg$svr))
+g1 <- nl |> pivot_longer(-Modelo, names_to = "Métrica") |> ggplot(aes(Modelo, value, fill = Modelo)) + geom_col(show.legend = FALSE) + facet_wrap(~Métrica, scales = "free_y") + scale_fill_brewer(palette = "Set2") +
+  geom_text(aes(label = sprintf("%.3f", value)), vjust = -.3, size = 3.2) + labs(title = "Lineal vs. aprendizaje automático (prueba)", x = NULL, y = NULL)
+g2 <- ggplot(rr, aes(res, color = Modelo)) + geom_density(linewidth = .9) + scale_color_brewer(palette = "Set2") + labs(title = "Densidad de los residuos", x = "Observado − predicho (m³/m³)", y = "Densidad")
+grid.arrange(g1, g2, ncol = 2, widths = c(1.2, 1))
+```
+
+## Clasificación
+
+```{r comp-cls, fig.height=4.8}
+comp_cls <- tab_cls |> mutate(Clave = names(nombres_cls)[match(Modelo, nombres_cls)], Interpretabilidad = c(glm = "Alta", rf = "Media", svm = "Baja", knn = "Baja", nb = "Media")[Clave],
+                              Complejidad = complej_cls[Clave], Elegido = ifelse(Clave == mejor_cls, "◄ seleccionado", "")) |> select(-Clave)
+kable(comp_cls, digits = 3, caption = "Comparación integral de los clasificadores (prueba, umbral 0,5).")
+tab_cls |> select(Modelo, Accuracy, Precision, Recall, F1, `ROC-AUC`, `PR-AUC`) |> pivot_longer(-Modelo, names_to = "Métrica") |> mutate(Métrica = factor(Métrica, c("Accuracy", "Precision", "Recall", "F1", "ROC-AUC", "PR-AUC"))) |>
+  ggplot(aes(Métrica, value, fill = Modelo)) + geom_col(position = "dodge") + scale_fill_brewer(palette = "Set2") + labs(title = "Métricas de clasificación en la prueba", x = NULL, y = "Valor", fill = NULL)
+```
+
+**Selección.** Por la regla del error estándar sobre el ROC de validación se elige **`r nombres_cls[[mejor_cls]]`**; en la prueba alcanza ROC-AUC `r round(met_cls(c_te, prob_cls[[mejor_cls]])[["ROC-AUC"]], 3)`, PR-AUC `r round(met_cls(c_te, prob_cls[[mejor_cls]])[["PR-AUC"]], 3)`
+(prevalencia `r round(mean(c_te == "Alto"), 3)`) y, con el umbral `r UMBRAL`, recall `r round(met_cls(c_te, prob_cls[[mejor_cls]], UMBRAL)[["Recall"]], 3)` con precision `r round(met_cls(c_te, prob_cls[[mejor_cls]], UMBRAL)[["Precision"]], 3)`.
+
+```{r roc-mejor, fig.height=4.4, fig.width=5.5}
+r_m <- pROC::roc(c_te, prob_cls[[mejor_cls]], levels = c("Bajo", "Alto"), direction = "<", quiet = TRUE); ci_auc <- pROC::ci.auc(r_m)
+ggplot(tibble(fpr = 1 - r_m$specificities, tpr = r_m$sensitivities), aes(fpr, tpr)) + geom_line(color = "#e76f51", linewidth = 1.1) + geom_abline(linetype = 2, color = "grey50") +
+  labs(title = paste("Curva ROC del mejor clasificador:", nombres_cls[[mejor_cls]]), subtitle = sprintf("AUC = %.3f (IC 95 %%: %.3f–%.3f)", as.numeric(r_m$auc), ci_auc[1], ci_auc[3]), x = "1 − especificidad", y = "Sensibilidad (recall)")
+```
+
+# Interpretación de resultados
+
+## ¿Qué condiciones se asocian más con la humedad del suelo?
+
+```{r importancia, fig.height=5.5, fig.width=10}
+imp <- function(m, titulo) { v <- varImp(m, scale = TRUE)$importance; v <- tibble(Variable = rownames(v), Importancia = v[[1]]) |> slice_max(Importancia, n = 12)
+  ggplot(v, aes(reorder(Variable, Importancia), Importancia)) + geom_col(fill = "#2a9d8f") + coord_flip() + labs(title = titulo, x = NULL, y = "Importancia relativa (0–100)") }
+grid.arrange(imp(modelos_reg$rf, "Random Forest – regresión (humedad)"), imp(modelos_cls$rf, "Random Forest – clasificación (riesgo)"), ncol = 2)
+```
+
+La importancia de Random Forest mide cuánto empeora la predicción cuando se permutan o se omiten las divisiones de una variable; **no indica causalidad ni el signo del efecto**. Para ver la forma de la relación se calcula la **dependencia parcial** manual (promedio de las predicciones al variar una variable y mantener las demás tal como se observan):
+
+```{r pdp, fig.height=4}
+set.seed(SEMILLA); xs <- X_te[sample(nrow(X_te), 600), ]
+top2 <- head(rownames(varImp(modelos_reg$rf, scale = TRUE)$importance)[order(-varImp(modelos_reg$rf, scale = TRUE)$importance[[1]])], 3); top2 <- top2[top2 %in% vars_num]
+pd <- bind_rows(lapply(top2, \(v) { g <- seq(quantile(X_te[[v]], .02), quantile(X_te[[v]], .98), length.out = 25)
+  tibble(Variable = v, x = g * pp$std[[v]] + pp$mean[[v]], y = sapply(g, \(val) { z <- xs; z[[v]] <- val; mean(predict(modelos_reg$rf, z)) })) }))
+ggplot(pd, aes(x, y)) + geom_line(color = "#264653", linewidth = 1) + facet_wrap(~Variable, scales = "free_x") + labs(title = "Dependencia parcial de la humedad predicha (Random Forest)", x = "Valor de la variable (unidades originales)", y = "Humedad media predicha (m³/m³)")
+```
+
+Si las curvas son crecientes y se aplanan, indican la **saturación** esperable: añadir lluvia aumenta la humedad hasta que el suelo se aproxima a su capacidad de campo. Una relación de este tipo no es captable por el modelo lineal, lo que explica parte de la ventaja de los modelos no lineales.
+
+# Aplicación a la Administración Pública: AgroAlerta Antioquia
+
+## Concepto
+
+AgroAlerta Antioquia convierte los datos satelitales y climáticos abiertos en un **tablero municipal de alerta temprana** que se actualiza de forma automática con los scripts del proyecto. Para cada municipio con cobertura entrega: (i) la humedad del suelo estimada,
+(ii) la probabilidad de que esté en condición inusualmente baja para la época y (iii) un nivel de alerta orientativo. Es una herramienta de **apoyo a decisiones**, no sustituye las mediciones de campo ni el criterio del técnico agropecuario.
+
+## Mapa del riesgo hídrico municipal
+
+```{r mapa, fig.height=6.2, fig.width=10}
+pred_te <- te |> mutate(prob = prob_cls[[mejor_cls]], alerta = prob >= UMBRAL)
+res_mun <- pred_te |> group_by(cod_mpio) |> summarise(n = n(), `Observado` = 100 * mean(Riesgo_Hidrico == "Alto"), `Predicho (modelo)` = 100 * mean(alerta), .groups = "drop") |> filter(n >= 15)
+mp <- mun |> left_join(res_mun, by = "cod_mpio") |> pivot_longer(c(`Observado`, `Predicho (modelo)`), names_to = "Fuente", values_to = "pct")
+mp <- bind_rows(mp, mun |> filter(!cod_mpio %in% res_mun$cod_mpio) |> mutate(Fuente = "Observado", pct = NA_real_))
+ggplot(mp) + geom_sf(aes(fill = pct), color = "white", linewidth = .1) + facet_wrap(~Fuente) +
+  scale_fill_viridis_c(option = "B", direction = -1, na.value = "grey85", name = "% de días\nen riesgo alto") +
+  labs(title = "Riesgo hídrico por municipio en el periodo de prueba", subtitle = "Gris = municipio sin observaciones SMAP suficientes (píxel de 9 km no resuelve el municipio)") + theme_void() + theme(legend.position = "right", plot.title = element_text(face = "bold"))
+```
+
+El mapa compara la proporción de días en riesgo alto **observada** (derivada de SMAP) con la **predicha** por el modelo seleccionado únicamente a partir de variables meteorológicas. La comparación entre ambos paneles permite juzgar si el modelo recupera la geografía del riesgo (solo en el periodo de prueba, que es un tramo corto); las diferencias se deben tanto a errores del modelo como al umbral de decisión.
+
+## Ejemplo de lectura por una UMATA
+
+```{r alerta}
+ult <- max(d$fecha); ventana <- ult - 59
+semaf <- pred_te |> filter(fecha >= ventana) |> group_by(cod_mpio, Municipio) |> summarise(n_obs = n(), `% días con alerta` = 100 * mean(alerta), `Prob. media de riesgo alto` = mean(prob), .groups = "drop") |> filter(n_obs >= 5) |>
+  left_join(distinct(d, cod_mpio, Tipo_Cultivo, Area_Agricola_ha), by = "cod_mpio") |>
+  mutate(Nivel = cut(`% días con alerta`, c(-1, 20, 40, 60, 101), labels = c("Verde (vigilancia normal)", "Amarillo (atención)", "Naranja (preparación)", "Rojo (acción prioritaria)"))) |> arrange(desc(`% días con alerta`))
+cat("**Ejemplo ilustrativo con datos históricos, NO es el estado operativo actual:** el último dato del dataset es del", format(ult), "\n")
+cat("Ventana de análisis:", format(ventana), "a", format(ult), "(últimos 60 días del dataset). Municipios con ≥5 observaciones:", nrow(semaf), "\n")
+kable(head(semaf |> select(Municipio, `Cultivo predominante` = Tipo_Cultivo, `Área sembrada (ha)` = Area_Agricola_ha, `Días con obs.` = n_obs, `% días con alerta`, Nivel), 10), digits = 1, format.args = list(big.mark = "."),
+      caption = "Ejemplo: los 10 municipios con mayor proporción de días en alerta en los últimos 60 días disponibles. Niveles y cortes (20/40/60 %) son **ilustrativos** y deben calibrarse con las UMATA.")
+table(semaf$Nivel) |> as.data.frame() |> setNames(c("Nivel", "Municipios")) |> kable()
+```
+
+**Cómo lo interpretaría una administración municipal.** Si un municipio aparece en nivel *naranja* o *rojo*, el modelo indica que en las últimas semanas las condiciones meteorológicas han sido consistentes con una humedad del suelo inferior a lo habitual para esa época. La UMATA puede usarlo como **señal para verificar en campo**
+(visita a fincas de la zona, revisión de lluvia local), no como diagnóstico concluyente. Un nivel *verde* no garantiza ausencia de estrés en una finca concreta: el modelo no ve microclimas, tipo de suelo ni manejo del cultivo.
+
+## Usos para la gestión pública
+
+1. **Identificar municipios y zonas con mayor riesgo hídrico:** ordenar los municipios por proporción de días en alerta y por tendencia, y cruzar con el área sembrada (EVA/UPRA) para estimar cuánta superficie agrícola queda expuesta.
+2. **Priorizar la asistencia técnica:** programar visitas de las UMATA primero a los municipios en rojo/naranja con mayor área de cultivos sensibles.
+3. **Orientar recomendaciones preventivas a pequeños productores:** mensajes sencillos (acolchado, protección de nacimientos y reservorios, ajuste del calendario de siembra, riego de apoyo) cuando el municipio entra en atención.
+4. **Apoyar la planificación del riego:** las series de probabilidad de humedad baja, junto con criterios de requerimientos hídricos de los cultivos (Allen et al., 1998), ayudan a decidir dónde y cuándo vale la pena invertir en riego complementario y cosecha de agua.
+5. **Fortalecer los planes municipales de adaptación al cambio climático:** los mapas de frecuencia histórica de riesgo alto aportan evidencia local a los diagnósticos de amenaza y vulnerabilidad (World Bank Group, 2021; OECD, 2026).
+6. **Orientar la distribución de recursos del riesgo agropecuario:** el indicador sirve como un criterio objetivo más —no el único— para focalizar subsidios, insumos o proyectos de infraestructura hídrica.
+
+> **Lo que el sistema NO hace:** no predice pérdidas económicas ni daños en cultivos (no hay datos de rendimiento o siniestros en este estudio), no reemplaza la medición de humedad en finca y no describe condiciones a escala de lote.
+
+# Limitaciones del estudio
+
+0. **R² de prueba negativo en regresión.** Se debe a un sesgo sistemático por cambio de régimen entre entrenamiento y prueba (véase la sección *¿Por qué el R² de prueba sale negativo?*), no a un error de cálculo.
+0. **Cobertura parcial de SMAP (limitación principal de esta versión).** El dataset usa únicamente las ventanas de ~60 días listadas en el aviso inicial; el periodo de prueba es un tramo corto y el de entrenamiento no es continuo. Por eso las métricas son preliminares y su generalización a otras épocas del año y a 2015–2026 no está demostrada.
+1. **Resolución espacial.** SMAP tiene píxeles de ~9 km y POWER celdas de ~50 km; ambos suavizan el relieve andino. Los municipios pequeños (`r 125 - n_distinct(d$cod_mpio)` sin ningún píxel) quedan sin cobertura y los resultados municipales son promedios regionales, no valores de finca.
+2. **Calidad de SMAP en zona de alta biomasa.** La mayoría de las recuperaciones no cumple el criterio de «calidad recomendada»; el filtro principal es más permisivo y su incertidumbre es mayor (véase el análisis de sensibilidad). SMAP mide solo los primeros ~5 cm del suelo, no la zona radicular.
+3. **Cobertura irregular.** SMAP no observa cada municipio todos los días; la serie es irregular y no se modelan dependencias temporales explícitas (sin variable rezagada de humedad).
+4. **POWER es un producto de reanálisis/satélite**, no una medición in situ; su precipitación puede diferir de la de pluviómetros locales. El contraste con el IDEAM **no pudo realizarse** en esta versión si la sección *Contraste con IDEAM* indica que no hay datos: el servicio de datos abiertos no entregó respuestas a las consultas diarias agregadas.
+5. **Elevación** de la celda POWER, no de un modelo digital del terreno.
+6. **Definición del riesgo.** Es un indicador estadístico relativo (percentil 20 histórico por municipio–mes) calculado sobre pocas ventanas discontinuas de observación (cobertura SMAP parcial); no corresponde a un índice oficial de sequía ni incluye déficit en el rendimiento del cultivo. Los resultados dependen del umbral elegido (ver sensibilidad).
+7. **Estacionariedad.** El modelo asume que las relaciones lluvia–humedad aprendidas en el pasado se mantienen; fenómenos como El Niño/La Niña o el cambio climático pueden alterarlas. No se incorporó el índice ONI.
+8. **Inferencia del modelo lineal.** La autocorrelación de los residuos hace que los errores estándar sean optimistas.
+9. **Calibración de probabilidades.** El down-sampling distorsiona las probabilidades; las alertas son ordinales, no probabilidades calibradas.
+10. **Submuestra de ajuste.** Por costo computacional, los modelos comparados se entrenaron con 12.000 observaciones; modelos con más datos o mayor búsqueda de hiperparámetros podrían mejorar.
+11. **Sin validación con usuarios.** Los niveles de alerta son ilustrativos y requieren calibración participativa con las UMATA y los productores.
+
+# Conclusiones y recomendaciones
+
+```{r conclusiones-datos, include=FALSE}
+r_best <- met_reg(y_te, pred_reg[[mejor_reg]]); r_lm <- met_reg(y_te, pred_reg$lm); r_base <- met_reg(y_te, pred_base)
+c_best <- met_cls(c_te, prob_cls[[mejor_cls]], UMBRAL)
+```
+
+**Sobre los datos.** Se integraron datos reales y abiertos —SMAP, NASA POWER, DANE y UPRA— en un dataset de `r format(nrow(d), big.mark = ".")` observaciones municipio–día de `r n_distinct(d$cod_mpio)` municipios de Antioquia (`r format(min(d$fecha))` a `r format(max(d$fecha))`).
+
+**Predicción de la humedad del suelo.** Con partición cronológica y validación de origen móvil, el modelo seleccionado (**`r nombres_reg[[mejor_reg]]`**) alcanza en la prueba RMSE = `r round(r_best[["RMSE"]], 4)` m³/m³ y $R^2$ = `r round(r_best[["R2"]], 3)`;
+el modelo lineal obtiene RMSE = `r round(r_lm[["RMSE"]], 4)` y $R^2$ = `r round(r_lm[["R2"]], 3)`, y la línea base de climatología RMSE = `r round(r_base[["RMSE"]], 4)` y $R^2$ = `r round(r_base[["R2"]], 3)`.
+
+**Clasificación del riesgo.** El clasificador seleccionado (**`r nombres_cls[[mejor_cls]]`**) logra ROC-AUC = `r round(c_best[["ROC-AUC"]], 3)`, PR-AUC = `r round(c_best[["PR-AUC"]], 3)` (prevalencia en prueba `r round(mean(c_te == "Alto"), 3)`), recall = `r round(c_best[["Recall"]], 3)` y precision = `r round(c_best[["Precision"]], 3)` con un umbral elegido sin mirar la prueba.
+
+**Utilidad para la gestión pública.**
+
+```{r interpretacion-final, results="asis", echo=FALSE}
+prev <- mean(c_te == "Alto"); lift <- c_best[["PR-AUC"]] / prev
+cat(sprintf("Con la cobertura parcial disponible (periodo de prueba: %s a %s; %s observaciones de prueba), el modelo de regresión seleccionado (%s) **%s** a la línea base de climatología (R² = %.3f frente a %.3f) y %s al modelo lineal (R² = %.3f). ",
+  format(min(te$fecha)), format(max(te$fecha)), format(nrow(te), big.mark = "."), nombres_reg[[mejor_reg]], ifelse(r_best[["RMSE"]] < r_base[["RMSE"]], "supera", "no supera"), r_best[["R2"]], r_base[["R2"]],
+  ifelse(r_best[["RMSE"]] < r_lm[["RMSE"]], "mejora", "no mejora"), r_lm[["R2"]]))
+b_best <- mean(y_te - pred_reg[[mejor_reg]])
+if (r_best[["R2"]] < 0) cat(sprintf("Un R² negativo no indica un error de cálculo: significa que, en este periodo de prueba, el modelo predice peor que usar la media de la prueba, principalmente por un sesgo sistemático (obs − pred = %.3f m³/m³; correlación r = %.2f), consecuencia de que la prueba es un tramo corto y más seco que el entrenamiento. ", b_best, cor(y_te, pred_reg[[mejor_reg]])))
+cat(sprintf("En clasificación, el PR-AUC del modelo seleccionado (%s) es %.1f veces la prevalencia de riesgo alto (%.3f), lo que %s; con el umbral elegido en validación detecta %.0f %% de los casos de riesgo alto con una precision de %.0f %%. ",
+  nombres_cls[[mejor_cls]], lift, prev, ifelse(lift >= 1.5, "indica que el modelo aporta información útil más allá del azar", "indica que el modelo aporta poca información más allá del azar"), 100 * c_best[["Recall"]], 100 * c_best[["Precision"]]))
+cat("En términos de gestión pública, estos resultados justifican, **a lo sumo, usar la herramienta como una señal preliminar para priorizar verificaciones en campo**, y solo tras completar la serie SMAP, validar con estaciones locales (IDEAM no pudo contrastarse en esta versión) y calibrar los niveles de alerta con las UMATA. No hay evidencia en este estudio sobre pérdidas en cultivos ni sobre el desempeño en otras épocas del año.\n")
+```
+
+**Recomendaciones.**
+
+1. Adoptar el sistema como **herramienta de focalización y verificación**, no de decisión automática; calibrar los niveles de alerta con las UMATA.
+2. Incorporar **estaciones locales** (IDEAM, redes municipales o sensores de bajo costo) para validar y corregir el modelo a escala de finca.
+3. Mejorar la resolución con un **modelo digital de elevación**, productos de lluvia como GPM IMERG y suelos (SoilGrids), y añadir el índice ONI para capturar la variabilidad interanual (El Niño/La Niña).
+4. Incluir **variables autorregresivas** y modelos de series de tiempo para pronosticar con 7–14 días de anticipación (aquí se estima la condición actual a partir del clima observado).
+5. Medir en el futuro **impactos reales** (rendimientos, siniestros) para vincular el riesgo hídrico con consecuencias económicas, algo que este estudio no puede afirmar.
+
+```{r cierre, include=FALSE}
+stopCluster(cl); registerDoSEQ()
+```
+
+# Referencias bibliográficas
+
+Allen, R. G., Pereira, L. S., Raes, D., & Smith, M. (1998). *Crop evapotranspiration: Guidelines for computing crop water requirements* (FAO Irrigation and Drainage Paper 56). Food and Agriculture Organization of the United Nations. https://www.fao.org/3/x0490e/x0490e00.htm
+
+Breiman, L. (2001). Random forests. *Machine Learning, 45*(1), 5–32. https://doi.org/10.1023/A:1010933404324
+
+Chan, S. K., Bindlish, R., O'Neill, P., Jackson, T., Njoku, E., Dunbar, S., Chaubell, J., Piepmeier, J., Yueh, S., Entekhabi, D., Colliander, A., Chen, F., Cosh, M. H., Caldwell, T., Walker, J., Berg, A., McNairn, H., Thibeault, M., Martínez-Fernández, J., … Kerr, Y. (2018). Development and assessment of the SMAP enhanced passive soil moisture product. *Remote Sensing of Environment, 204*, 931–941. https://doi.org/10.1016/j.rse.2017.08.025
+
+Departamento Administrativo Nacional de Estadística. (2025). *Marco Geoestadístico Nacional (MGN) 2025* [Servicio de entidades geográficas]. DANE. https://portalgis.dane.gov.co/mparcgis/rest/services/MGN2025/Serv_CapasMGN_2025/FeatureServer
+
+Entekhabi, D., Njoku, E. G., O'Neill, P. E., Kellogg, K. H., Crow, W. T., Edelstein, W. N., Entin, J. K., Goodman, S. D., Jackson, T. J., Johnson, J., Kimball, J., Piepmeier, J. R., Koster, R. D., Martin, N., McDonald, K. C., Moghaddam, M., Moran, S., Reichle, R., Shi, J. C., … Van Zyl, J. (2010). The Soil Moisture Active Passive (SMAP) mission. *Proceedings of the IEEE, 98*(5), 704–716. https://doi.org/10.1109/JPROC.2010.2043918
+
+Fox, J., & Weisberg, S. (2019). *An R companion to applied regression* (3.ª ed.). Sage.
+
+Hastie, T., Tibshirani, R., & Friedman, J. (2009). *The elements of statistical learning: Data mining, inference, and prediction* (2.ª ed.). Springer. https://doi.org/10.1007/978-0-387-84858-7
+
+Instituto de Hidrología, Meteorología y Estudios Ambientales. (s. f.). *Temperatura ambiente del aire*, *Humedad del aire* y *Precipitación* [Conjuntos de datos]. Datos Abiertos Colombia. https://www.datos.gov.co
+
+James, G., Witten, D., Hastie, T., & Tibshirani, R. (2021). *An introduction to statistical learning with applications in R* (2.ª ed.). Springer. https://doi.org/10.1007/978-1-0716-1418-1
+
+Karthikeyan, L., Chawla, I., & Mishra, A. K. (2020). A review of remote sensing applications in agriculture for food security: Crop growth and yield, irrigation, and crop losses. *Journal of Hydrology, 586*, Artículo 124905. https://doi.org/10.1016/j.jhydrol.2020.124905
+
+Kuhn, M. (2008). Building predictive models in R using the caret package. *Journal of Statistical Software, 28*(5), 1–26. https://doi.org/10.18637/jss.v028.i05
+
+OECD. (2015). *OECD review of agricultural policies: Colombia 2015*. OECD Publishing. https://doi.org/10.1787/9789264227644-en
+
+OECD. (2026). *OECD environmental performance reviews: Colombia 2026*. OECD Publishing. https://doi.org/10.1787/968398f7-en
+
+O'Neill, P., Chan, S., Njoku, E., Jackson, T., Bindlish, R., & Chaubell, J. (2023). *SMAP enhanced L3 radiometer global and polar grid daily 9 km EASE-Grid soil moisture, version 6* [Conjunto de datos]. NASA National Snow and Ice Data Center Distributed Active Archive Center. https://doi.org/10.5067/M20OXIZHY3RJ
+
+R Core Team. (2025). *R: A language and environment for statistical computing*. R Foundation for Statistical Computing. https://www.R-project.org/
+
+Roberts, D. R., Bahn, V., Ciuti, S., Boyce, M. S., Elith, J., Guillera-Arroita, G., Hauenstein, S., Lahoz-Monfort, J. J., Schröder, B., Thuiller, W., Warton, D. I., Wintle, B. A., Hartig, F., & Dormann, C. F. (2017). Cross-validation strategies for data with temporal, spatial, hierarchical, or phylogenetic structure. *Ecography, 40*(8), 913–929. https://doi.org/10.1111/ecog.02881
+
+Saito, T., & Rehmsmeier, M. (2015). The precision-recall plot is more informative than the ROC plot when evaluating binary classifiers on imbalanced datasets. *PLOS ONE, 10*(3), Artículo e0118432. https://doi.org/10.1371/journal.pone.0118432
+
+Seneviratne, S. I., Corti, T., Davin, E. L., Hirschi, M., Jaeger, E. B., Lehner, I., Orlowsky, B., & Teuling, A. J. (2010). Investigating soil moisture–climate interactions in a changing climate: A review. *Earth-Science Reviews, 99*(3–4), 125–161. https://doi.org/10.1016/j.earscirev.2010.02.004
+
+Sparks, A. H. (2018). nasapower: A NASA POWER global meteorology, surface solar energy and climatology data client for R. *Journal of Open Source Software, 3*(30), Artículo 1035. https://doi.org/10.21105/joss.01035
+
+Sungmin, O., & Orth, R. (2021). Global soil moisture data derived through machine learning trained with in-situ measurements. *Scientific Data, 8*, Artículo 170. https://doi.org/10.1038/s41597-021-00964-1
+
+Svoboda, M., LeComte, D., Hayes, M., Heim, R., Gleason, K., Angel, J., Rippey, B., Tinker, R., Palecki, M., Stooksbury, D., Miskus, D., & Stephens, S. (2002). The Drought Monitor. *Bulletin of the American Meteorological Society, 83*(8), 1181–1190. https://doi.org/10.1175/1520-0477-83.8.1181
+
+Unidad de Planificación Rural Agropecuaria. (2026). *Evaluaciones Agropecuarias Municipales – EVA 2019–2025. Base agrícola* [Conjunto de datos]. Datos Abiertos Colombia. https://www.datos.gov.co/resource/uejq-wxrr.json
+
+Vergara, W., Rios, A. R., Trapido, P., & Malarín, H. (2014). *Agriculture and future climate in Latin America and the Caribbean: Systemic impacts and potential responses* (IDB Discussion Paper No. IDB-DP-329). Inter-American Development Bank. https://doi.org/10.18235/0007905
+
+Wilhite, D. A., & Glantz, M. H. (1985). Understanding the drought phenomenon: The role of definitions. *Water International, 10*(3), 111–120. https://doi.org/10.1080/02508068508686328
+
+World Bank Group. (2021). *Climate risk country profile: Colombia*. World Bank. https://climateknowledgeportal.worldbank.org
+
+NASA Langley Research Center. (s. f.). *NASA POWER: Prediction Of Worldwide Energy Resources – Daily API documentation*. https://power.larc.nasa.gov/docs/services/api/temporal/daily/

@@ -1,0 +1,10 @@
+# Archivos pesados / regenerables
+outputs/cache/
+outputs/*.log
+tt.tar.xz
+.TinyTeX/
+Rplots.pdf
+.Rhistory
+.RData
+.Rproj.user/
+*_files/
