@@ -8,3 +8,8 @@ Rplots.pdf
 .RData
 .Rproj.user/
 *_files/
+figures/*.pdf
+outputs/*.tex
+outputs/*.log
+outputs/*.aux
+outputs/*.toc
